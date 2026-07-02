@@ -3,3 +3,5 @@ __pycache__/
 kmc_output
 
 lkmc.exe
+
+scan_params.txt
