@@ -142,6 +142,20 @@ struct KMCParams {
 };
 
 // Parse a simple "key = value" config file.
+static inline int toInt(const std::string& s, int def = 0) {
+    try { return s.empty() ? def : std::stoi(s); }
+    catch (...) { return def; }
+}
+
+static inline double toDouble(const std::string& s, double def = 0.0) {
+    try { return s.empty() ? def : std::stod(s); }
+    catch (...) { return def; }
+}
+
+static inline uint64_t toHex(const std::string& s, uint64_t def = 0) {
+    try { return s.empty() ? def : std::stoull(s, nullptr, 16); }
+    catch (...) { return def; }
+}
 KMCParams load_config(const std::string& path, KMCParams p = {}) {
     std::ifstream f(path);
     if (!f) throw std::runtime_error("Cannot open config file: " + path);
@@ -161,26 +175,29 @@ KMCParams load_config(const std::string& path, KMCParams p = {}) {
             s = (b == std::string::npos) ? "" : s.substr(b, e - b + 1);
         };
         trim(key); trim(val);
-        if (key == "Nx")             p.Nx             = std::stoi(val);
-        else if (key == "Ny")        p.Ny             = std::stoi(val);
-        else if (key == "T")         p.T              = std::stod(val);
-        else if (key == "d0")        p.d0             = std::stod(val);
-        else if (key == "e0")        p.e0             = std::stod(val);
-        else if (key == "e1")        p.e1             = std::stod(val);
-        else if (key == "nu_f")      p.nu_f           = std::stod(val);
-        else if (key == "nu_d")      p.nu_d           = std::stod(val);
-        else if (key == "max_steps") p.max_steps      = std::stoi(val);
-        else if (key == "max_time")  p.max_time       = std::stod(val);
-        else if (key == "pcg_state_hi") p.pcg.state_hi = std::stoull(val, nullptr, 16);
-        else if (key == "pcg_state_lo") p.pcg.state_lo = std::stoull(val, nullptr, 16);
-        else if (key == "pcg_inc_hi")   p.pcg.inc_hi   = std::stoull(val, nullptr, 16);
-        else if (key == "pcg_inc_lo")   p.pcg.inc_lo   = std::stoull(val, nullptr, 16);
-        else if (key == "periodic_x")    p.periodic_x     = (std::stoi(val) != 0);
-        else if (key == "log_every")     p.log_every      = std::stoi(val);
-        else if (key == "snapshot_every") p.snapshot_every = std::stoi(val);
-        else if (key == "save_snapshots") p.save_snapshots = (std::stoi(val) != 0);
-        else if (key == "save_npy")      p.save_npy       = (std::stoi(val) != 0);
-        else if (key == "output_dir")    p.output_dir     = val;
+        if (key == "Nx")              p.Nx = toInt(val, p.Nx);
+        else if (key == "Ny")         p.Ny = toInt(val, p.Ny);
+        else if (key == "T")          p.T  = toDouble(val, p.T);
+        else if (key == "d0")         p.d0 = toDouble(val, p.d0);
+        else if (key == "e0")         p.e0 = toDouble(val, p.e0);
+        else if (key == "e1")         p.e1 = toDouble(val, p.e1);
+        else if (key == "nu_f")       p.nu_f = toDouble(val, p.nu_f);
+        else if (key == "nu_d")       p.nu_d = toDouble(val, p.nu_d);
+        else if (key == "max_steps")  p.max_steps = toInt(val, p.max_steps);
+        else if (key == "max_time")   p.max_time = toDouble(val, p.max_time);
+
+        else if (key == "pcg_state_hi") p.pcg.state_hi = toHex(val, p.pcg.state_hi);
+        else if (key == "pcg_state_lo") p.pcg.state_lo = toHex(val, p.pcg.state_lo);
+        else if (key == "pcg_inc_hi")   p.pcg.inc_hi = toHex(val, p.pcg.inc_hi);
+        else if (key == "pcg_inc_lo")   p.pcg.inc_lo = toHex(val, p.pcg.inc_lo);
+
+        else if (key == "periodic_x")    p.periodic_x = (toInt(val, 1) != 0);
+        else if (key == "log_every")     p.log_every = toInt(val, p.log_every);
+        else if (key == "snapshot_every") p.snapshot_every = toInt(val, p.snapshot_every);
+        else if (key == "save_snapshots") p.save_snapshots = (toInt(val, 1) != 0);
+        else if (key == "save_npy")       p.save_npy = (toInt(val, 1) != 0);
+
+        else if (key == "output_dir")    p.output_dir = val;
         else if (key == "history_file")  p.history_filename = val;
     }
     return p;

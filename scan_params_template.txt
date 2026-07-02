@@ -2,6 +2,8 @@
 # A parameter with one value is fixed across all runs.
 # A parameter with multiple comma-separated values is swept.
 
+# The python code should auto-find this file if you copy it and rename it to "scan_params.txt." To use for the C++ version, run the command with "./lkmc scan_params.txt" (or with any other file name). 
+
 Nx = 40
 Ny = 25
 T = 300.0, 400.0, 500.0
