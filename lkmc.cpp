@@ -39,7 +39,6 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
-#include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
@@ -51,7 +50,13 @@
 #include <unordered_map>
 #include <vector>
 
-namespace fs = std::filesystem;
+#if __has_include(<filesystem>)
+  #include <filesystem>
+  namespace fs = std::filesystem;
+#else
+  #include <experimental/filesystem>
+  namespace fs = std::experimental::filesystem;
+#endif
 
 // ---------------------------------------------------------------------------
 // PCG64 — identical to numpy.random.default_rng() draw sequence.
@@ -94,8 +99,10 @@ private:
         // MUL = 0x2360ed051fc65da4_4385df649fccf645
         __uint128_t s   = ((__uint128_t)s_hi_ << 64) | s_lo_;
         __uint128_t inc = ((__uint128_t)i_hi_ << 64) | i_lo_;
+        const uint64_t MUL_HI = 0x2360ed051fc65da4ULL;
+        const uint64_t MUL_LO = 0x4385df649fccf645ULL;
         const __uint128_t MUL =
-            ((__uint128_t)0x2360ed051fc65da4ULL << 64) | 0x4385df649fccf645ULL;
+            ((__uint128_t)MUL_HI << 64) | (__uint128_t)MUL_LO;
         s    = s * MUL + inc;
         s_hi_ = (uint64_t)(s >> 64);
         s_lo_ = (uint64_t)s;
