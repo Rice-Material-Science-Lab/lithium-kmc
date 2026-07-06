@@ -39,6 +39,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
@@ -50,13 +51,7 @@
 #include <unordered_map>
 #include <vector>
 
-#if __has_include(<filesystem>)
-  #include <filesystem>
-  namespace fs = std::filesystem;
-#else
-  #include <experimental/filesystem>
-  namespace fs = std::experimental::filesystem;
-#endif
+namespace fs = std::filesystem;
 
 // ---------------------------------------------------------------------------
 // PCG64 — identical to numpy.random.default_rng() draw sequence.
