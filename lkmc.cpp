@@ -39,7 +39,9 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#ifndef __EMSCRIPTEN__
 #include <filesystem>
+#endif
 #include <fstream>
 #include <iomanip>
 #include <iostream>
@@ -50,8 +52,12 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
-
+#ifdef __EMSCRIPTEN__
+#include <emscripten.h>
+#endif
+#ifndef __EMSCRIPTEN__
 namespace fs = std::filesystem;
+#endif
 
 // ---------------------------------------------------------------------------
 // PCG64 — identical to numpy.random.default_rng() draw sequence.
@@ -281,6 +287,7 @@ struct HistoryRow {
 // ---------------------------------------------------------------------------
 class ElectrodepositionKMC {
 public:
+    ~ElectrodepositionKMC() = default;
     explicit ElectrodepositionKMC(const KMCParams& p)
         : p_(p),
           rng_(p.pcg),
@@ -314,11 +321,12 @@ public:
         energy_lookup_[SUBSTRATE][SUBSTRATE] = p_.e1;
 
         // Prepare output directory.
+        #ifndef __EMSCRIPTEN__
         out_dir_ = fs::path(p_.output_dir);
         fs::create_directories(out_dir_);
         if (p_.save_snapshots)
             fs::create_directories(out_dir_ / "snapshots");
-
+        #endif
         // Build event index table.
         setup_indices();
 
@@ -557,6 +565,7 @@ private:
         return changed;
     }
 
+    public:
     // -----------------------------------------------------------------------
     // KMC step (mirrors execute_step)
     // -----------------------------------------------------------------------
@@ -601,7 +610,7 @@ private:
         ++step_;
         return true;
     }
-
+private:
     // -----------------------------------------------------------------------
     // Output helpers
     // -----------------------------------------------------------------------
@@ -697,10 +706,13 @@ private:
 
     void finalize_outputs() {
         record_history("final");
+
+    #ifndef __EMSCRIPTEN__
         std::string tag = "final_step_" + std::to_string(step_);
         if (p_.save_snapshots) save_snapshot(tag);
         if (p_.save_npy)       save_lattice_npy(tag);
         write_history_csv();
+    #endif
     }
 
     // -----------------------------------------------------------------------
@@ -722,10 +734,55 @@ private:
 
     double time_ = 0.0;
     int    step_ = 0;
-
-    fs::path out_dir_;
+    #ifndef __EMSCRIPTEN__
+        fs::path out_dir_;
+    #endif
     std::vector<HistoryRow> history_;
 };
+
+#ifdef __EMSCRIPTEN__
+
+static ElectrodepositionKMC* wasm_sim = nullptr;
+
+extern "C" {
+
+EMSCRIPTEN_KEEPALIVE
+void init_simulation() {
+    KMCParams params;
+    wasm_sim = new ElectrodepositionKMC(params);
+}
+
+EMSCRIPTEN_KEEPALIVE
+void run_steps(int steps) {
+    if (!wasm_sim) return;
+
+    for (int i = 0; i < steps; i++) {
+        if (!wasm_sim->execute_step())
+            break;
+    }
+}
+
+EMSCRIPTEN_KEEPALIVE
+int get_step() {
+    if (!wasm_sim) return 0;
+    return wasm_sim->step();
+}
+
+EMSCRIPTEN_KEEPALIVE
+double get_time() {
+    if (!wasm_sim) return 0.0;
+    return wasm_sim->time();
+}
+
+EMSCRIPTEN_KEEPALIVE
+void cleanup_simulation() {
+    delete wasm_sim;
+    wasm_sim = nullptr;
+}
+
+}
+
+#endif
 
 // ---------------------------------------------------------------------------
 // main
@@ -769,6 +826,6 @@ int main(int argc, char* argv[]) {
         std::cerr << "Simulation error: " << e.what() << '\n';
         return 1;
     }
-
+    
     return 0;
 }
