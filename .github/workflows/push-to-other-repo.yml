@@ -23,17 +23,6 @@ jobs:
         run: |
           emcc lkmc-wasm.cpp -O3 --bind -sMODULARIZE -sEXPORT_ES6 -sALLOW_MEMORY_GROWTH -o lkmc-wasm.js
 
-      - name: Check secret
-        env:
-          DEST_PAT: ${{ secrets.UPDATE_WASM_PAT }}
-        run: |
-          if [ -z "$DEST_PAT" ]; then
-          echo "PAT is empty"
-          exit 1
-          else
-          echo "PAT exists"
-          fi
-
       - name: Push Build Artifacts to Destination Repo
         env:
           DEST_PAT: ${{ secrets.UPDATE_WASM_PAT }}
