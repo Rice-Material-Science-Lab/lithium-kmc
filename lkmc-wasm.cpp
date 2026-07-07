@@ -338,8 +338,10 @@ public:
 
         // Record initial state.
         record_history("initial");
+        #ifndef __EMSCRIPTEN__
         if (p_.save_snapshots) save_snapshot("initial");
         if (p_.save_npy)       save_lattice_npy("initial");
+        #endif
     }
 
     // -----------------------------------------------------------------------
@@ -350,6 +352,7 @@ public:
             if (!execute_step()) break;
             if (step_ % p_.log_every == 0)
                 record_history("regular");
+            #ifndef __EMSCRIPTEN__
             if (p_.save_snapshots && step_ % p_.snapshot_every == 0) {
                 char tag[32]; snprintf(tag, sizeof(tag), "step_%07d", step_);
                 save_snapshot(tag);
@@ -358,6 +361,7 @@ public:
                 char tag[32]; snprintf(tag, sizeof(tag), "step_%07d", step_);
                 save_lattice_npy(tag);
             }
+            #endif
         }
         finalize_outputs();
     }

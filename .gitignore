@@ -5,3 +5,7 @@ kmc_output
 lkmc.exe
 
 scan_params.txt
+
+lkmc-wasm.wasm
+
+lkmc-wasm.js
