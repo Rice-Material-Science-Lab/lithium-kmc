@@ -755,9 +755,9 @@ private:
 
 #ifdef __EMSCRIPTEN__
 
-static ElectrodepositionKMC* wasm_sim = nullptr;
-
 extern "C" {
+
+static ElectrodepositionKMC* wasm_sim = nullptr;
 
 EMSCRIPTEN_KEEPALIVE
 void init_simulation() {
