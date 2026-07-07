@@ -4,7 +4,6 @@
  * WASM version of C++ port of LKMC_v2_commented_b.py.
  *
  * Build (emscripten sdk needed):
- *
  * emcc lkmc-wasm.cpp -O3 --bind -sMODULARIZE -sEXPORT_ES6 -sALLOW_MEMORY_GROWTH -o lkmc-wasm.js
  *
  * Then, you should be able to use this on the web
@@ -634,7 +633,8 @@ private:
         for (double r : event_rates_) tr += r;
         history_.push_back({label, step_, time_, nf, nd, nt, tr});
     }
-
+    
+    #ifndef __EMSCRIPTEN__
     void write_history_csv() const {
         fs::path out = out_dir_ / p_.history_filename;
         std::ofstream f(out);
@@ -650,10 +650,12 @@ private:
               << row.total_rate << '\n';
         }
     }
+    #endif
 
     // Write a colour PPM (P6) snapshot scaled up so each lattice cell is CELL_PX pixels.
     // PPM is supported by most image viewers, GIMP, Photoshop, and IrfanView without plugins.
     // Colors: black=EMPTY  steel-blue=FREE  amber=DEPOSITED  dark-grey=SUBSTRATE
+    #ifndef __EMSCRIPTEN__
     void save_snapshot(const std::string& tag) const {
         const int CELL_PX = std::max(8, std::min(24, 400 / std::max(p_.Nx, p_.Ny)));
         const int IMG_W   = p_.Nx * CELL_PX;
@@ -696,9 +698,11 @@ private:
                 f.write(reinterpret_cast<const char*>(row_buf.data()), row_buf.size());
         }
     }
+    #endif
 
     // Write the raw lattice as a simple binary file: 4-byte header (Ny, Nx),
     // then Ny*Nx int8 values in row-major order (row 0 = substrate).
+    #ifndef __EMSCRIPTEN__
     void save_lattice_npy(const std::string& tag) const {
         fs::path out = out_dir_ / ("lattice_" + tag + ".bin");
         std::ofstream f(out, std::ios::binary);
@@ -707,6 +711,7 @@ private:
         f.write(reinterpret_cast<const char*>(header), sizeof(header));
         f.write(reinterpret_cast<const char*>(lattice_.data()), lattice_.size());
     }
+    #endif
 
     void finalize_outputs() {
         record_history("final");
@@ -788,6 +793,7 @@ void cleanup_simulation() {
 
 #endif
 
+#ifndef __EMSCRIPTEN__
 // ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
@@ -833,3 +839,4 @@ int main(int argc, char* argv[]) {
     
     return 0;
 }
+#endif
