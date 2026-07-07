@@ -39,7 +39,7 @@ jobs:
           DEST_PAT: ${{ secrets.UPDATE_WASM_PAT }}
         run: |
           # Clone the repo into a temp folder
-          git clone https://x-access-token:${DEST_PAT}@://github.com dest-repo
+          git clone https://x-access-token:${DEST_PAT}@github.com/Rice-Material-Science-Lab/lithium-website.git dest-repo
 
           # Copy js and wasm files into the public folder
           mkdir -p dest-repo/public/
