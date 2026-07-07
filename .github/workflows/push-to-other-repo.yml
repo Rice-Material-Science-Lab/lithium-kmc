@@ -9,7 +9,7 @@ on:
 jobs:
   build-and-push:
     runs-on: ubuntu-latest
-    
+
     steps:
       - name: Checkout Source Repo
         uses: actions/checkout@v4
@@ -17,30 +17,31 @@ jobs:
       - name: Setup Emscripten
         uses: mymindstorm/setup-emsdk@v14
         with:
-          version: 'latest'
+          version: "latest"
 
       - name: Compile C++ to WASM
         run: |
-          emcc lkmc-wasm.cpp -O3 --bind -sMODULARIZE -sEXPORT_ES6 -sALLOW_MEMORY_GROWTH -o lkmc-wasm.js
+          mkdir -p public
+          emcc lkmc.cpp -o public/lkmc-wasm.js -s EXPORT_ES6=1 -s MODULARIZE=1 -s EXPORTED_RUNTIME_METHODS="['ccall','cwrap']" -s EXPORTED_FUNCTIONS="['_init_simulation','_run_steps','_get_step','_get_time','_cleanup_simulation','_main']" -O3
 
       - name: Push Build Artifacts to Destination Repo
         env:
-          DEST_PAT: ${{ secrets.UPDATE_WASM_PAT }} 
+          DEST_PAT: ${{ secrets.UPDATE_WASM_PAT }}
         run: |
           # Clone the repo into a temp folder
-          git clone https://x-access-token:${DEST_PAT}@://github.com dest-repo
-          
+          git clone https://x-access-token:${DEST_PAT}@github.com/Rice-Material-Science-Lab/lithium-website.git dest-repo
+
           # Copy js and wasm files into the public folder
           mkdir -p dest-repo/public/
           cp lkmc-wasm.js dest-repo/public/
           cp lkmc-wasm.wasm dest-repo/public/
-          
+
           # Commit and push changes
           cd dest-repo
           git config user.name "GitHub Actions Bot"
           git config user.email "actions@github.com"
           git add public/lkmc-wasm.js public/lkmc-wasm.wasm
-          
+
           # Only commit if changes actually exist to avoid failing the workflow step
           git diff-index --quiet HEAD || git commit -m "Automated WASM build update"
           git push origin main
