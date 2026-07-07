@@ -18,6 +18,7 @@ jobs:
         uses: mymindstorm/setup-emsdk@v14
         with:
           version: "latest"
+          version: "latest"
 
       - name: Compile C++ to WASM
         run: |
