@@ -58,6 +58,17 @@
 #ifdef __EMSCRIPTEN__
 #include <emscripten.h>
 #endif
+#ifdef __EMSCRIPTEN__
+#include <emscripten.h>
+
+extern "C" {
+EM_JS(void, updateFrontend, (int step, double time), {
+    if (typeof window.updateSimulation === "function") {
+        window.updateSimulation(step, time);
+    }
+});
+}
+#endif
 #ifndef __EMSCRIPTEN__
 namespace fs = std::filesystem;
 #endif
@@ -772,6 +783,11 @@ void run_steps(int steps) {
     for (int i = 0; i < steps; i++) {
         if (!wasm_sim->execute_step())
             break;
+    #ifdef __EMSCRIPTEN__
+        if (wasm_sim->step() % 1000 == 0) {
+            updateFrontend(wasm_sim->step(), wasm_sim->time());
+        }
+    #endif
     }
 }
 
