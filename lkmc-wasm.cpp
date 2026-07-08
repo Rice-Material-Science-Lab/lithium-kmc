@@ -904,12 +904,36 @@
     extern "C" {
 
     static ElectrodepositionKMC* wasm_sim = nullptr;
+    static KMCParams wasm_params = KMCParams{};
 
     static std::string snapshot_json = "{}";
 
     EMSCRIPTEN_KEEPALIVE
     const char* get_snapshot_json() {
         return snapshot_json.c_str();
+    }
+
+    EMSCRIPTEN_KEEPALIVE
+    void set_params(
+        int Nx,
+        int Ny,
+        double d0,
+        double T,
+        double e0,
+        double e1,
+        double nu_f,
+        double nu_d,
+        int seed)
+    {
+        wasm_params.Nx = Nx;
+        wasm_params.Ny = Ny;
+        wasm_params.d0 = d0;
+        wasm_params.T = T;
+        wasm_params.e0 = e0;
+        wasm_params.e1 = e1;
+        wasm_params.nu_f = nu_f;
+        wasm_params.nu_d = nu_d;
+        wasm_params.rng_seed = seed;
     }
 
     EMSCRIPTEN_KEEPALIVE
@@ -920,8 +944,7 @@
             wasm_sim = nullptr;
         }
 
-        KMCParams params;
-        wasm_sim = new ElectrodepositionKMC(params);
+        wasm_sim = new ElectrodepositionKMC(wasm_params);
     }
 
     EMSCRIPTEN_KEEPALIVE
