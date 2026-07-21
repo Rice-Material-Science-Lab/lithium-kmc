@@ -27,13 +27,23 @@ Fallback
 --------
 If ``numba`` is not installed the code silently falls back to pure-Python mode
 (identical to v4b).  Install with:  pip install numba
+
+v3 changes
+----------
+* Added a conditional deposited-passivated bond rule.
+* A deposited-passivated bond contributes ``e0`` only when the deposited atom
+  has at least two deposited neighbors; otherwise that bond contributes zero.
+* Implemented this rule in both the Numba and pure-Python local-energy paths,
+  with inline comments marking the modified sections.
 """
 
 from __future__ import annotations
 
+import argparse
 import csv
 import itertools
 import math
+import sys
 import time
 import tkinter as tk
 from collections import deque
@@ -46,6 +56,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.colors import ListedColormap
+from matplotlib.collections import PolyCollection
 from matplotlib.figure import Figure
 
 # ---------------------------------------------------------------------------
@@ -76,6 +87,35 @@ SUBSTRATE  = 3
 PASSIVATED = 4
 
 Coord = Tuple[int, int]
+
+HEX_DX_EVEN = (1, -1, 0, 0, -1, -1)
+HEX_DY_EVEN = (0,  0, 1, -1, 1, -1)
+HEX_DX_ODD  = (1, -1, 0, 0,  1,  1)
+HEX_DY_ODD  = (0,  0, 1, -1, 1, -1)
+NUM_HEX_DIRECTIONS = 6
+
+
+def make_hex_vertices(Nx: int, Ny: int) -> List[List[Tuple[float, float]]]:
+    """Return touching pointy-top hexagon vertices for row-offset lattice sites."""
+    radius = 1.0 / math.sqrt(3.0)
+    row_step = 1.5 * radius
+    angles = [math.radians(90.0 + 60.0 * i) for i in range(6)]
+    vertices: List[List[Tuple[float, float]]] = []
+    for y in range(Ny):
+        cy = y * row_step
+        row_offset = 0.5 if y % 2 else 0.0
+        for x in range(Nx):
+            cx = x + row_offset
+            vertices.append([(cx + radius * math.cos(a), cy + radius * math.sin(a)) for a in angles])
+    return vertices
+
+
+def hex_axis_limits(Nx: int, Ny: int) -> Tuple[Tuple[float, float], Tuple[float, float]]:
+    radius = 1.0 / math.sqrt(3.0)
+    row_step = 1.5 * radius
+    x_max = (Nx - 1) + (0.5 if Ny > 1 else 0.0)
+    y_max = (Ny - 1) * row_step
+    return (-radius, x_max + radius), (-radius, y_max + radius)
 
 # ===========================================================================
 # Numba-compiled simulation kernel
@@ -126,6 +166,36 @@ def _nb_fen_find(tree: np.ndarray, size: int, target: float) -> int:
 # ---------------------------------------------------------------------------
 
 @njit(cache=True)
+def _nb_count_deposited_neighbors(
+    lattice: np.ndarray,
+    x: int, y: int,
+    Ny: int, Nx: int,
+    periodic_x: bool,
+) -> int:
+    """Count DEPOSITED neighbors around a site on the hex lattice."""
+    n_dep = 0
+    if y % 2 == 0:
+        DX = (1, -1, 0, 0, -1, -1)
+        DY = (0,  0, 1, -1, 1, -1)
+    else:
+        DX = (1, -1, 0, 0, 1, 1)
+        DY = (0,  0, 1, -1, 1, -1)
+    for k in range(6):
+        xx = x + DX[k]
+        yy = y + DY[k]
+        if periodic_x:
+            xx = xx % Nx
+        else:
+            if xx < 0 or xx >= Nx:
+                continue
+        if yy < 0 or yy >= Ny:
+            continue
+        if lattice[yy, xx] == DEPOSITED:
+            n_dep += 1
+    return n_dep
+
+
+@njit(cache=True)
 def _nb_calc_local_energy(
     lattice: np.ndarray,
     x: int, y: int,
@@ -136,9 +206,20 @@ def _nb_calc_local_energy(
 ) -> float:
     """Sum pair interaction energies for a hypothetical atom of `atom_type` at (x,y)."""
     e = 0.0
-    DX = (1, -1, 0, 0)
-    DY = (0,  0, 1, -1)
-    for k in range(4):
+    # v3 change: DEPOSITED-PASSIVATED bonds are now conditional on the
+    # deposited atom having at least two deposited neighbors.
+    dep_neighbors_at_site = -1
+    if atom_type == DEPOSITED:
+        dep_neighbors_at_site = _nb_count_deposited_neighbors(
+            lattice, x, y, Ny, Nx, periodic_x
+        )
+    if y % 2 == 0:
+        DX = (1, -1, 0, 0, -1, -1)
+        DY = (0,  0, 1, -1, 1, -1)
+    else:
+        DX = (1, -1, 0, 0, 1, 1)
+        DY = (0,  0, 1, -1, 1, -1)
+    for k in range(6):
         xx = x + DX[k]
         yy = y + DY[k]
         if periodic_x:
@@ -149,7 +230,17 @@ def _nb_calc_local_energy(
         if yy < 0 or yy >= Ny:
             continue
         nbr = lattice[yy, xx]
-        e += energy_lookup[atom_type, nbr]
+        if atom_type == DEPOSITED and nbr == PASSIVATED:
+            if dep_neighbors_at_site >= 2:
+                e += energy_lookup[DEPOSITED, PASSIVATED]
+        elif atom_type == PASSIVATED and nbr == DEPOSITED:
+            nbr_dep_neighbors = _nb_count_deposited_neighbors(
+                lattice, xx, yy, Ny, Nx, periodic_x
+            )
+            if nbr_dep_neighbors >= 2:
+                e += energy_lookup[PASSIVATED, DEPOSITED]
+        else:
+            e += energy_lookup[atom_type, nbr]
     return e
 
 
@@ -160,9 +251,13 @@ def _nb_has_empty_neighbor(
     Ny: int, Nx: int,
     periodic_x: bool,
 ) -> bool:
-    DX = (1, -1, 0, 0)
-    DY = (0,  0, 1, -1)
-    for k in range(4):
+    if y % 2 == 0:
+        DX = (1, -1, 0, 0, -1, -1)
+        DY = (0,  0, 1, -1, 1, -1)
+    else:
+        DX = (1, -1, 0, 0, 1, 1)
+        DY = (0,  0, 1, -1, 1, -1)
+    for k in range(6):
         xx = x + DX[k]
         yy = y + DY[k]
         if periodic_x:
@@ -185,9 +280,13 @@ def _nb_desired_mobile_state(
     periodic_x: bool,
 ) -> int:
     """Return FREE(1) or DEPOSITED(2) based on neighbors, ignoring current site."""
-    DX = (1, -1, 0, 0)
-    DY = (0,  0, 1, -1)
-    for k in range(4):
+    if y % 2 == 0:
+        DX = (1, -1, 0, 0, -1, -1)
+        DY = (0,  0, 1, -1, 1, -1)
+    else:
+        DX = (1, -1, 0, 0, 1, 1)
+        DY = (0,  0, 1, -1, 1, -1)
+    for k in range(6):
         xx = x + DX[k]
         yy = y + DY[k]
         if periodic_x:
@@ -324,8 +423,6 @@ def _nb_refresh_local_rates(
         cy = changed_y[ci]
         for dx in range(-2, 3):
             for dy in range(-2, 3):
-                if abs(dx) + abs(dy) > 2:
-                    continue
                 xx = cx + dx
                 yy = cy + dy
                 if periodic_x:
@@ -349,9 +446,9 @@ def _nb_refresh_local_rates(
                         energy_lookup, d0, nu_f, nu_d, nu_p, kB, T,
                     )
 
-                # Hop events (4 directions)
-                base = num_drop_events + (yy * Nx + xx) * 4
-                for offset in range(4):
+                # Hop events (6 hex directions)
+                base = num_drop_events + (yy * Nx + xx) * 6
+                for offset in range(6):
                     _nb_update_rate_at_idx(
                         base + offset,
                         lattice, ftree, event_rates,
@@ -392,10 +489,7 @@ def _nb_bonding_relaxation(
     n_changed  = 0
     buf_cap    = len(queue_x)
 
-    DX = (1, -1, 0, 0)
-    DY = (0,  0, 1, -1)
-
-    # Seed the queue with each seed site and its 4 neighbours
+    # Seed the queue with each seed site and its 6 hex neighbours
     for si in range(n_seeds):
         sx = seeds_x[si]
         sy = seeds_y[si]
@@ -407,8 +501,15 @@ def _nb_bonding_relaxation(
             queue_tail += 1
             in_queue[sy, sx] = True
 
+        if sy % 2 == 0:
+            DX = (1, -1, 0, 0, -1, -1)
+            DY = (0,  0, 1, -1, 1, -1)
+        else:
+            DX = (1, -1, 0, 0, 1, 1)
+            DY = (0,  0, 1, -1, 1, -1)
+
         # Neighbours of seed
-        for k in range(4):
+        for k in range(6):
             xx = sx + DX[k]
             yy = sy + DY[k]
             if periodic_x:
@@ -445,8 +546,15 @@ def _nb_bonding_relaxation(
             out_y[n_changed] = y
             n_changed += 1
 
+        if y % 2 == 0:
+            DX = (1, -1, 0, 0, -1, -1)
+            DY = (0,  0, 1, -1, 1, -1)
+        else:
+            DX = (1, -1, 0, 0, 1, 1)
+            DY = (0,  0, 1, -1, 1, -1)
+
         # Enqueue neighbours (may need re-evaluation)
-        for k in range(4):
+        for k in range(6):
             xx = x + DX[k]
             yy = y + DY[k]
             if periodic_x:
@@ -648,26 +756,28 @@ class KMCParams:
     Ny: int   = 25
     T:  float = 300.0
     d0: float = 1.0e3
-    e0: float = -0.2
+    e0: float = -0.28
     e1: float = -0.5
     nu_f: float = 5.0e9
-    nu_d: float = 1.0e9
-    nu_p: float = 1.0e2
+    nu_d: float = 5.0e9
+    nu_p: float = 1.0e3
     kB:   float = 8.617333262145e-5
-    max_steps: int   = 400_000
+    max_steps: int   = 4000_000
     max_time:  float = 100.0
     rng_seed:  Optional[int] = 394583
     periodic_x: bool = True
-    log_every:       int  = 1000
+    log_every:       int  = 10_000
     save_snapshots:  bool = True
     snapshot_every:  int  = 10_000
     save_npy_states: bool = True
     output_dir:       str = "kmc_output"
     history_filename: str = "time_series.csv"
     validation_enabled: bool = False
-    validation_every:   int  = 1000
-    gui_batch_steps:    int  = 2000         # larger batch → fewer Python↔C crossings
+    validation_every:   int  = 20_000
+    gui_batch_steps:    int  = 20_000         # larger batch → fewer Python↔C crossings
+    plot_counts_vs_time: bool = True         # v3 change: False=plot counts vs step, True=plot counts vs sim time
     stop_fill_fraction: Optional[float] = None
+    stop_fill_total_sites: Optional[int] = None
 
 
 # ===========================================================================
@@ -741,6 +851,8 @@ class ElectrodepositionKMC:
         el[DEPOSITED,  SUBSTRATE]  = self.p.e1
         el[SUBSTRATE,  DEPOSITED]  = self.p.e1
         el[SUBSTRATE,  SUBSTRATE]  = self.p.e1
+        # v3 change: keep the base DEPOSITED-PASSIVATED lookup at e0, but the
+        # actual contribution is now gated in calc_local_energy/_nb_calc_local_energy.
         el[PASSIVATED, DEPOSITED]  = self.p.e0
         el[DEPOSITED,  PASSIVATED] = self.p.e0
         el[PASSIVATED, PASSIVATED] = self.p.e0
@@ -749,7 +861,7 @@ class ElectrodepositionKMC:
 
         # ── event indexing ────────────────────────────────────────────────
         self.num_drop_events       = self.p.Nx
-        self.num_hop_events        = self.p.Nx * self.p.Ny * 4
+        self.num_hop_events        = self.p.Nx * self.p.Ny * NUM_HEX_DIRECTIONS
         self.num_passivation_events = self.p.Nx * self.p.Ny
         self.max_events = (self.num_drop_events
                            + self.num_hop_events
@@ -807,11 +919,10 @@ class ElectrodepositionKMC:
             self.idx_to_data[x] = ("drop", None, (x, top_y))
 
         base  = self.num_drop_events
-        dirs  = ((1, 0), (-1, 0), (0, 1), (0, -1))
         for y in range(self.p.Ny):
             for x in range(self.p.Nx):
-                offset = (y * self.p.Nx + x) * 4
-                for i, (dx, dy) in enumerate(dirs):
+                offset = (y * self.p.Nx + x) * NUM_HEX_DIRECTIONS
+                for i, (dx, dy) in enumerate(self.hex_neighbor_deltas(y)):
                     idx = base + offset + i
                     self.idx_to_data[idx] = ("hop", (x, y), (x + dx, y + dy))
 
@@ -840,11 +951,10 @@ class ElectrodepositionKMC:
 
         # Hop events
         base = self.num_drop_events
-        dirs = ((1, 0), (-1, 0), (0, 1), (0, -1))
         for y in range(self.p.Ny):
             for x in range(self.p.Nx):
-                for i, (dx, dy) in enumerate(dirs):
-                    idx = base + (y * self.p.Nx + x) * 4 + i
+                for i, (dx, dy) in enumerate(self.hex_neighbor_deltas(y)):
+                    idx = base + (y * self.p.Nx + x) * NUM_HEX_DIRECTIONS + i
                     self._ev_kind[idx]  = 1
                     self._ev_src_x[idx] = x
                     self._ev_src_y[idx] = y
@@ -897,9 +1007,15 @@ class ElectrodepositionKMC:
             return x
         return None
 
+    @staticmethod
+    def hex_neighbor_deltas(y: int) -> Tuple[Coord, ...]:
+        if y % 2 == 0:
+            return tuple(zip(HEX_DX_EVEN, HEX_DY_EVEN))
+        return tuple(zip(HEX_DX_ODD, HEX_DY_ODD))
+
     def valid_neighbor_coords(self, x: int, y: int) -> List[Coord]:
         nbrs: List[Coord] = []
-        for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+        for dx, dy in self.hex_neighbor_deltas(y):
             xx = self.wrap_x(x + dx)
             if xx is None:
                 continue
@@ -911,18 +1027,26 @@ class ElectrodepositionKMC:
     def radius2_sites(self, seeds: Sequence[Coord]) -> List[Coord]:
         seen: set = set()
         out:  List[Coord] = []
+        frontier = set(seeds)
         for x0, y0 in seeds:
-            for dx in range(-2, 3):
-                for dy in range(-2, 3):
-                    if abs(dx) + abs(dy) > 2:
-                        continue
-                    xx = self.wrap_x(x0 + dx)
-                    yy = y0 + dy
-                    if xx is None or not (0 <= yy < self.p.Ny):
-                        continue
-                    if (xx, yy) not in seen:
-                        seen.add((xx, yy))
-                        out.append((xx, yy))
+            if (x0, y0) not in seen and 0 <= y0 < self.p.Ny:
+                xx0 = self.wrap_x(x0)
+                if xx0 is not None:
+                    seen.add((xx0, y0))
+                    out.append((xx0, y0))
+
+        for _ in range(2):
+            next_frontier = set()
+            for x, y in frontier:
+                xx = self.wrap_x(x)
+                if xx is None or not (0 <= y < self.p.Ny):
+                    continue
+                for nbr in self.valid_neighbor_coords(xx, y):
+                    if nbr not in seen:
+                        seen.add(nbr)
+                        out.append(nbr)
+                        next_frontier.add(nbr)
+            frontier = next_frontier
         return out
 
     # ------------------------------------------------------------------
@@ -933,7 +1057,7 @@ class ElectrodepositionKMC:
         return x
 
     def hop_base_index(self, x: int, y: int) -> int:
-        return self.num_drop_events + (y * self.p.Nx + x) * 4
+        return self.num_drop_events + (y * self.p.Nx + x) * NUM_HEX_DIRECTIONS
 
     def passivation_index(self, x: int, y: int) -> int:
         return self.num_drop_events + self.num_hop_events + y * self.p.Nx + x
@@ -942,10 +1066,31 @@ class ElectrodepositionKMC:
     # Energetics (Python path — used by rebuild_all_rates / validation)
     # ------------------------------------------------------------------
 
+    def count_deposited_neighbors(self, x: int, y: int) -> int:
+        """Count DEPOSITED neighbors around a site on the hex lattice."""
+        n_dep = 0
+        for nx, ny in self.valid_neighbor_coords(x, y):
+            if int(self.lattice[ny, nx]) == DEPOSITED:
+                n_dep += 1
+        return n_dep
+
     def calc_local_energy(self, x: int, y: int, atom_type: int) -> float:
         e = 0.0
+        # v3 change: DEPOSITED-PASSIVATED bonds only contribute e0 when the
+        # deposited atom involved in that bond has at least two deposited neighbors.
+        dep_neighbors_at_site = None
+        if atom_type == DEPOSITED:
+            dep_neighbors_at_site = self.count_deposited_neighbors(x, y)
         for nx, ny in self.valid_neighbor_coords(x, y):
-            e += self.energy_lookup[atom_type, int(self.lattice[ny, nx])]
+            nbr = int(self.lattice[ny, nx])
+            if atom_type == DEPOSITED and nbr == PASSIVATED:
+                if dep_neighbors_at_site is not None and dep_neighbors_at_site >= 2:
+                    e += self.energy_lookup[DEPOSITED, PASSIVATED]
+            elif atom_type == PASSIVATED and nbr == DEPOSITED:
+                if self.count_deposited_neighbors(nx, ny) >= 2:
+                    e += self.energy_lookup[PASSIVATED, DEPOSITED]
+            else:
+                e += self.energy_lookup[atom_type, nbr]
         return e
 
     def site_has_empty_neighbor(self, x: int, y: int) -> bool:
@@ -1008,7 +1153,7 @@ class ElectrodepositionKMC:
             if y == self.p.Ny - 1:
                 self.update_rate_at_index(self.drop_index(x))
             base = self.hop_base_index(x, y)
-            for offset in range(4):
+            for offset in range(NUM_HEX_DIRECTIONS):
                 self.update_rate_at_index(base + offset)
             self.update_rate_at_index(self.passivation_index(x, y))
 
@@ -1114,10 +1259,21 @@ class ElectrodepositionKMC:
                     self.record_history(label="regular")
             return n, False
 
+        # In compiled mode, trim the batch so we can still run Python-side
+        # validation at the exact requested step interval.
+        steps_to_run = n
+        if self.p.validation_enabled:
+            next_validation = (
+                (self.step // self.p.validation_every) + 1
+            ) * self.p.validation_every
+            steps_until_validation = next_validation - self.step
+            if steps_until_validation > 0:
+                steps_to_run = min(steps_to_run, steps_until_validation)
+
         # Pre-generate 2*n random numbers using the same PCG64 generator as the
         # original Python mode.  Calling .random(size=2*n) produces the identical
         # sequence as 2*n sequential .random() calls — so trajectories match exactly.
-        rand_array = self.rng.random(size=2 * n)
+        rand_array = self.rng.random(size=2 * steps_to_run)
 
         steps_done, new_step, new_time, n_log = _nb_run_n_steps(
             self.lattice,
@@ -1131,7 +1287,7 @@ class ElectrodepositionKMC:
             self.p.d0, self.p.nu_f, self.p.nu_d, self.p.nu_p,
             self.p.kB, self.p.T,
             self.max_events, self.num_drop_events, self.num_hop_events,
-            n,
+            steps_to_run,
             self.p.max_steps, self.p.max_time, self.p.log_every,
             self.step, self.time,
             self._buf_direct_x, self._buf_direct_y,
@@ -1165,6 +1321,13 @@ class ElectrodepositionKMC:
 
         self.step = int(new_step)
         self.time = float(new_time)
+
+        if (
+            self.p.validation_enabled
+            and steps_done > 0
+            and self.step % self.p.validation_every == 0
+        ):
+            self.validate_against_full_rebuild()
 
         finished = (
             self.step >= self.p.max_steps
@@ -1235,9 +1398,20 @@ class ElectrodepositionKMC:
         fig_w    = max(6, self.p.Nx * cell_px / 80)
         fig_h    = max(4, self.p.Ny * cell_px / 80)
         fig, ax  = plt.subplots(figsize=(fig_w + 2, fig_h + 1.5), dpi=100)
-        im = ax.imshow(self.lattice_for_display(), cmap=self._cmap,
-                       vmin=0, vmax=4, interpolation="nearest", aspect="equal")
-        cbar = fig.colorbar(im, ax=ax, ticks=[0, 1, 2, 3, 4], fraction=0.046, pad=0.04)
+        hexes = PolyCollection(
+            make_hex_vertices(self.p.Nx, self.p.Ny),
+            array=self.lattice.ravel(),
+            cmap=self._cmap,
+            edgecolors="#cfcfcf",
+            linewidths=0.25,
+        )
+        hexes.set_clim(0, 4)
+        ax.add_collection(hexes)
+        (xmin, xmax), (ymin, ymax) = hex_axis_limits(self.p.Nx, self.p.Ny)
+        ax.set_xlim(xmin, xmax)
+        ax.set_ylim(ymin, ymax)
+        ax.set_aspect("equal", adjustable="box")
+        cbar = fig.colorbar(hexes, ax=ax, ticks=[0, 1, 2, 3, 4], fraction=0.046, pad=0.04)
         cbar.ax.set_yticklabels(["Empty", "Free", "Deposited", "Substrate", "Passivated"])
         cbar.ax.tick_params(labelsize=9)
         ax.set_xlabel("x  (lattice site)", fontsize=10)
@@ -1261,14 +1435,26 @@ class ElectrodepositionKMC:
     def init_gui_figure(self) -> None:
         self._fig   = Figure(figsize=(6, 5))
         self._ax    = self._fig.add_subplot(111)
-        self._im    = self._ax.imshow(self.lattice_for_display(), cmap=self._cmap, vmin=0, vmax=4)
+        self._im    = PolyCollection(
+            make_hex_vertices(self.p.Nx, self.p.Ny),
+            array=self.lattice.ravel(),
+            cmap=self._cmap,
+            edgecolors="#cfcfcf",
+            linewidths=0.25,
+        )
+        self._im.set_clim(0, 4)
+        self._ax.add_collection(self._im)
+        (xmin, xmax), (ymin, ymax) = hex_axis_limits(self.p.Nx, self.p.Ny)
+        self._ax.set_xlim(xmin, xmax)
+        self._ax.set_ylim(ymin, ymax)
+        self._ax.set_aspect("equal", adjustable="box")
         self._title = self._ax.set_title(f"Step {self.step}, Time {self.time:.2e}")
         self._ax.set_xlabel("x"); self._ax.set_ylabel("y")
 
     def refresh_gui_figure(self) -> None:
         if self._im is None:
             return
-        self._im.set_data(self.lattice_for_display())
+        self._im.set_array(self.lattice.ravel())
         self._title.set_text(f"Step {self.step}, Time {self.time:.2e}")
 
     # ------------------------------------------------------------------
@@ -1290,7 +1476,7 @@ class ElectrodepositionKMC:
         in batches of _CLI_BATCH steps, making scan-mode runs as fast as the
         GUI mode.  The pure-Python fallback is used otherwise.
         """
-        total_sites = self.p.Nx * (self.p.Ny - 1)
+        total_sites = self.p.stop_fill_total_sites or self.p.Nx * (self.p.Ny - 1)
 
         if not NUMBA_AVAILABLE:
             # ── Pure-Python path (identical to v4b) ────────────────────────
@@ -1379,6 +1565,9 @@ class SimulationGUI:
         ("log_every",      int,   "log_every",     "Log interval (steps)",      "Record history every N steps"),
         ("snapshot_every", int,   "snapshot_every","Snapshot interval (steps)", "Save PNG snapshot every N steps"),
         ("periodic_x",     int,   None,            "Periodic x  (1=yes)",       "Use periodic boundary conditions in x"),
+        # v3 change: GUI toggle for using simulation time instead of KMC step
+        # on the atom-count history plot x-axis.
+        ("plot_counts_vs_time", int, None,         "Plot counts vs time (1=yes)", "Use simulation time on the count-plot x-axis instead of KMC step"),
         ("rng_seed",       int,   "rng_seed",      "Random seed",               "Seed for reproducibility"),
     ]
 
@@ -1395,7 +1584,9 @@ class SimulationGUI:
         self.stopped = False
         self.canvas: Optional[FigureCanvasTkAgg] = None
 
+        # v3 change: keep both possible x-axis histories for the GUI count plot.
         self._hist_steps:      List[int] = []
+        self._hist_times:      List[float] = []
         self._hist_free:       List[int] = []
         self._hist_deposited:  List[int] = []
         self._hist_passivated: List[int] = []
@@ -1461,15 +1652,22 @@ class SimulationGUI:
             ("Lattice Geometry",  self.FIELD_SPECS[0:2]),
             ("Physics",           self.FIELD_SPECS[2:9]),
             ("Run Controls",      self.FIELD_SPECS[9:13]),
-            ("Misc",              self.FIELD_SPECS[13:15]),
+            ("Misc",              self.FIELD_SPECS[13:16]),
         ]
         self.entries: dict = {}
         for group_label, specs in groups:
             frame = ttk.LabelFrame(parent, text=f"  {group_label}  ")
             frame.pack(fill="x", pady=(0, 6))
             for row_i, (pname, ptype, attr, label, tooltip) in enumerate(specs):
-                default_val = (str(getattr(self.params, attr)) if attr is not None
-                               else ("1" if self.params.periodic_x else "0"))
+                # v3 change: support GUI boolean toggles that are entered as 0/1.
+                if attr is not None:
+                    default_val = str(getattr(self.params, attr))
+                elif pname == "periodic_x":
+                    default_val = "1" if self.params.periodic_x else "0"
+                elif pname == "plot_counts_vs_time":
+                    default_val = "1" if self.params.plot_counts_vs_time else "0"
+                else:
+                    default_val = ""
                 ttk.Label(frame, text=label, anchor="w").grid(
                     row=row_i, column=0, sticky="w", padx=(8, 4), pady=2)
                 entry = ttk.Entry(frame, width=13)
@@ -1538,8 +1736,19 @@ class SimulationGUI:
         self._ax_lat.set_ylabel("y  (lattice site)", color=C["FG"], fontsize=8)
         self._ax_lat.set_title("Lattice  —  not started", color=C["ACC"], fontsize=9, pad=6)
         blank = np.zeros((self.params.Ny, self.params.Nx), dtype=np.int8)
-        self._im = self._ax_lat.imshow(blank, cmap=self._cmap_for_display(),
-                                       vmin=0, vmax=4, interpolation="nearest", aspect="auto")
+        self._im = PolyCollection(
+            make_hex_vertices(self.params.Nx, self.params.Ny),
+            array=blank.ravel(),
+            cmap=self._cmap_for_display(),
+            edgecolors="#313244",
+            linewidths=0.3,
+        )
+        self._im.set_clim(0, 4)
+        self._ax_lat.add_collection(self._im)
+        (xmin, xmax), (ymin, ymax) = hex_axis_limits(self.params.Nx, self.params.Ny)
+        self._ax_lat.set_xlim(xmin, xmax)
+        self._ax_lat.set_ylim(ymin, ymax)
+        self._ax_lat.set_aspect("equal", adjustable="box")
         cbar = self._fig.colorbar(self._im, ax=self._ax_lat,
                                   ticks=[0, 1, 2, 3, 4], fraction=0.03, pad=0.02)
         cbar.ax.set_yticklabels(["Empty", "Free", "Dep.", "Sub.", "Pass."])
@@ -1550,7 +1759,8 @@ class SimulationGUI:
         self._ax_cnt.set_facecolor(C["BG"])
         for sp in self._ax_cnt.spines.values(): sp.set_edgecolor(C["ACC"])
         self._ax_cnt.tick_params(colors=C["FG"], labelsize=8)
-        self._ax_cnt.set_xlabel("KMC step", color=C["FG"], fontsize=8)
+        # v3 change: x-axis label follows the selected count-plot mode.
+        self._ax_cnt.set_xlabel(self._count_plot_xlabel(), color=C["FG"], fontsize=8)
         self._ax_cnt.set_ylabel("Atom count", color=C["FG"], fontsize=8)
         self._ax_cnt.set_title("Atom counts over time", color=C["ACC"], fontsize=9, pad=6)
         self._line_free,  = self._ax_cnt.plot([], [], color="#5599dd", lw=1.5, label="Free")
@@ -1575,6 +1785,12 @@ class SimulationGUI:
     def _cmap_for_display():
         return ListedColormap(["#111111", "#5599dd", "#dd8833", "#222222", "#66bb6a"])
 
+    # v3 change: helper for the GUI count-plot x-axis label.
+    def _count_plot_xlabel(self) -> str:
+        if self.params.plot_counts_vs_time:
+            return "Simulation time (s)"
+        return "KMC step"
+
     # ── Parameter parsing ──────────────────────────────────────────────
 
     def parse_gui_params(self) -> KMCParams:
@@ -1586,6 +1802,8 @@ class SimulationGUI:
             except ValueError as exc:
                 raise ValueError(f"'{pname}' expects {ptype.__name__} but got '{raw}'.") from exc
         values["periodic_x"] = bool(values["periodic_x"])
+        # v3 change: parse the new GUI toggle as a bool from 0/1 entry text.
+        values["plot_counts_vs_time"] = bool(values["plot_counts_vs_time"])
         return KMCParams(**values)
 
     # ── Control callbacks ──────────────────────────────────────────────
@@ -1615,6 +1833,7 @@ class SimulationGUI:
         self.stopped = False
         self.pause_btn.config(text="⏸  Pause")
         self._hist_steps.clear()
+        self._hist_times.clear()
         self._hist_free.clear()
         self._hist_deposited.clear()
         self._hist_passivated.clear()
@@ -1631,14 +1850,17 @@ class SimulationGUI:
             return
 
         blank = np.zeros((self.params.Ny, self.params.Nx), dtype=np.int8)
-        self._im.set_data(blank)
-        self._im.set_extent([-0.5, self.params.Nx - 0.5,
-                              self.params.Ny - 0.5, -0.5])
-        self._ax_lat.set_xlim(-0.5, self.params.Nx - 0.5)
-        self._ax_lat.set_ylim(self.params.Ny - 0.5, -0.5)
+        self._im.set_verts(make_hex_vertices(self.params.Nx, self.params.Ny))
+        self._im.set_array(blank.ravel())
+        (xmin, xmax), (ymin, ymax) = hex_axis_limits(self.params.Nx, self.params.Ny)
+        self._ax_lat.set_xlim(xmin, xmax)
+        self._ax_lat.set_ylim(ymin, ymax)
+        self._ax_lat.set_aspect("equal", adjustable="box")
         self._line_free.set_data([], [])
         self._line_dep.set_data([], [])
         self._line_pass.set_data([], [])
+        # v3 change: refresh the x-axis label at run start in case the mode changed.
+        self._ax_cnt.set_xlabel(self._count_plot_xlabel(), color=self._colors["FG"], fontsize=8)
         self._ax_cnt.relim()
 
         self.run_btn.config(state="disabled")
@@ -1653,7 +1875,7 @@ class SimulationGUI:
     def _refresh_lattice(self) -> None:
         if self.sim is None:
             return
-        self._im.set_data(self.sim.lattice_for_display())
+        self._im.set_array(self.sim.lattice.ravel())
         self._ax_lat.set_title(
             f"Step {self.sim.step:,}    Sim time {self.sim.time:.3e} s    T={self.params.T} K",
             color=self._colors["ACC"], fontsize=9, pad=6)
@@ -1678,13 +1900,17 @@ class SimulationGUI:
             self._last_step_for_speed = self.sim.step
             self._last_wall_for_speed = now
 
+        # v3 change: record both step and simulation-time histories so the
+        # atom-count plot can switch x-axis modes.
         self._hist_steps.append(self.sim.step)
+        self._hist_times.append(self.sim.time)
         self._hist_free.append(nf)
         self._hist_deposited.append(nd)
         self._hist_passivated.append(npass)
-        self._line_free.set_data(self._hist_steps, self._hist_free)
-        self._line_dep.set_data(self._hist_steps, self._hist_deposited)
-        self._line_pass.set_data(self._hist_steps, self._hist_passivated)
+        x_hist = self._hist_times if self.params.plot_counts_vs_time else self._hist_steps
+        self._line_free.set_data(x_hist, self._hist_free)
+        self._line_dep.set_data(x_hist, self._hist_deposited)
+        self._line_pass.set_data(x_hist, self._hist_passivated)
         self._ax_cnt.relim()
         self._ax_cnt.autoscale_view()
 
@@ -1918,12 +2144,244 @@ def run_scan(scan_file: str, scan_output_dir: str = "scan_output") -> None:
 # -----------------------------------------------------------------------------
 # Main entry point
 # -----------------------------------------------------------------------------
-USE_GUI  = False   # Set to False for CLI or scan mode (want GUI)
-USE_SCAN = True   # Set to True to run a parameter scan (want SCAN)
+USE_GUI  = True   # Set to False for CLI or scan mode (want GUI)
+USE_SCAN = False   # Set to True to run a parameter scan (want SCAN)
 SCAN_FILE = "scan_params.txt"   # Path to your scan parameter file
 
+CLI_PARAM_ORDER = (
+    "--d0", "--T", "--e0", "--pv", "--vf", "--vd", "--seed", "--p",
+    "--maxStep", "--maxTime", "--folderName",
+)
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="python LKMC_v5_scan_and_fastGUI.py",
+        description="Run the LKMC electrodeposition simulator in GUI or command-line mode.",
+        formatter_class=argparse.RawTextHelpFormatter,
+        epilog=(
+            "CLI parameter order:\n"
+            "  --CLI --d0 <d0 value> --T <T_value> --e0 <e0_value> "
+            "--pv <pv_value> --vf <vf_value> --vd <vd_value> "
+            "--seed <seed_value> --p <percent> --maxStep <steps|BIG> "
+            "--maxTime <time|BIG> --folderName <folder_name>\n\n"
+            "All CLI parameters are optional. If omitted, the built-in KMCParams "
+            "default is used. Use BIG for --maxStep and/or --maxTime to disable "
+            "that limit. --folderName writes to kmc_output/<folder_name>."
+        ),
+    )
+    parser.add_argument(
+        "--CLI",
+        action="store_true",
+        help="Run in command-line mode without opening the GUI.",
+    )
+    parser.add_argument("--d0", type=float, help="Drop rate d0.")
+    parser.add_argument("--T", type=float, help="Temperature in Kelvin.")
+    parser.add_argument("--e0", type=float, help="Bonded energy e0 in eV.")
+    parser.add_argument("--pv", type=float, help="Passivation rate nu_p.")
+    parser.add_argument("--vf", type=float, help="Free atom attempt frequency nu_f.")
+    parser.add_argument("--vd", type=float, help="Deposited atom attempt frequency nu_d.")
+    parser.add_argument("--seed", type=int, help="Random seed.")
+    parser.add_argument(
+        "--p",
+        type=float,
+        help="Stop when deposited + passivated atoms fill this percent of the whole grid (1-100).",
+    )
+    parser.add_argument("--maxStep", type=str, help="Maximum KMC steps, or BIG to disable this limit.")
+    parser.add_argument("--maxTime", type=str, help="Maximum simulation time, or BIG to disable this limit.")
+    parser.add_argument("--folderName", type=str, help="Subfolder inside kmc_output/ for CLI run files.")
+    return parser
+
+
+def validate_cli_parameter_order(argv: Sequence[str], parser: argparse.ArgumentParser) -> None:
+    seen = [arg for arg in argv if arg in CLI_PARAM_ORDER]
+    expected = [arg for arg in CLI_PARAM_ORDER if arg in seen]
+    if seen != expected:
+        parser.error(
+            "CLI parameters must appear in this order: "
+            "--d0, --T, --e0, --pv, --vf, --vd, --seed, --p, "
+            "--maxStep, --maxTime, --folderName"
+        )
+
+
+def parse_cli_max_step(raw: Optional[str]) -> Optional[int]:
+    if raw is None:
+        return None
+    if raw.upper() == "BIG":
+        return 10**18
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError("--maxStep must be an integer or BIG.") from exc
+    if value < 1:
+        raise ValueError("--maxStep must be at least 1, or BIG.")
+    return value
+
+
+def parse_cli_max_time(raw: Optional[str]) -> Optional[float]:
+    if raw is None:
+        return None
+    if raw.upper() == "BIG":
+        return math.inf
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise ValueError("--maxTime must be a number or BIG.") from exc
+    if value <= 0:
+        raise ValueError("--maxTime must be positive, or BIG.")
+    return value
+
+
+def params_from_cli_args(args: argparse.Namespace) -> KMCParams:
+    params = KMCParams()
+    if args.d0 is not None:
+        params.d0 = args.d0
+    if args.T is not None:
+        params.T = args.T
+    if args.e0 is not None:
+        params.e0 = args.e0
+    if args.pv is not None:
+        params.nu_p = args.pv
+    if args.vf is not None:
+        params.nu_f = args.vf
+    if args.vd is not None:
+        params.nu_d = args.vd
+    if args.seed is not None:
+        params.rng_seed = args.seed
+    if args.p is not None:
+        if not 1.0 <= args.p <= 100.0:
+            raise ValueError("--p must be between 1 and 100 inclusive.")
+        params.stop_fill_fraction = args.p / 100.0
+        params.stop_fill_total_sites = params.Nx * params.Ny
+    max_step = parse_cli_max_step(args.maxStep)
+    if max_step is not None:
+        params.max_steps = max_step
+    max_time = parse_cli_max_time(args.maxTime)
+    if max_time is not None:
+        params.max_time = max_time
+    if args.folderName is not None:
+        params.output_dir = str(Path("kmc_output") / args.folderName)
+    return params
+
+
+def format_cli_value(value: object) -> str:
+    if value is None:
+        return "None"
+    if isinstance(value, float):
+        return f"{value:g}"
+    return str(value)
+
+
+def final_snapshot_tag(params: KMCParams, percentage: float) -> str:
+    return (
+        f"d{format_cli_value(params.d0)}"
+        f"T{format_cli_value(params.T)}"
+        f"e{format_cli_value(params.e0)}"
+        f"pv{format_cli_value(params.nu_p)}"
+        f"vf{format_cli_value(params.nu_f)}"
+        f"vd{format_cli_value(params.nu_d)}"
+        f"s{format_cli_value(params.rng_seed)}"
+        f"p{format_cli_value(percentage)}"
+    )
+
+
+def save_cli_final_snapshot(sim: ElectrodepositionKMC, percentage: float) -> Path:
+    final_dir = Path(__file__).resolve().parent / "FinalSnapshots"
+    final_dir.mkdir(parents=True, exist_ok=True)
+    old_snapshot_dir = sim.snapshot_dir
+    sim.snapshot_dir = final_dir
+    try:
+        return sim.save_snapshot(final_snapshot_tag(sim.p, percentage))
+    finally:
+        sim.snapshot_dir = old_snapshot_dir
+
+
+def normalize_all_results_csv(out_path: Path, fieldnames: Sequence[str]) -> None:
+    if not out_path.exists() or out_path.stat().st_size == 0:
+        return
+
+    with out_path.open(newline="") as f:
+        reader = csv.DictReader(f)
+        existing_fieldnames = reader.fieldnames or []
+        rows = list(reader)
+
+    if existing_fieldnames == list(fieldnames):
+        return
+
+    with out_path.open("w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({name: row.get(name, "") for name in fieldnames})
+
+
+def append_all_results_row(
+    params: KMCParams,
+    percentage: Optional[float],
+    steps: int,
+    sim_time: float,
+) -> Path:
+    out_path = Path(__file__).resolve().parent / "AllResults.csv"
+    fieldnames = ["d0", "T", "e0", "pv", "vf", "vd", "seed", "percentage", "Steps", "Time"]
+    normalize_all_results_csv(out_path, fieldnames)
+    write_header = not out_path.exists() or out_path.stat().st_size == 0
+    with out_path.open("a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        if write_header:
+            writer.writeheader()
+        writer.writerow({
+            "d0": params.d0,
+            "T": params.T,
+            "e0": params.e0,
+            "pv": params.nu_p,
+            "vf": params.nu_f,
+            "vd": params.nu_d,
+            "seed": params.rng_seed,
+            "percentage": "" if percentage is None else percentage,
+            "Steps": steps,
+            "Time": sim_time,
+        })
+    return out_path
+
+
+def run_single_cli(params: KMCParams, args: argparse.Namespace) -> None:
+    print("Running LKMC in command-line mode.")
+    print(
+        "Parameters: "
+        f"d0={params.d0:g}, T={params.T:g}, e0={params.e0:g}, "
+        f"nu_p={params.nu_p:g}, nu_f={params.nu_f:g}, nu_d={params.nu_d:g}, "
+        f"seed={params.rng_seed}, max_steps={params.max_steps}, "
+        f"max_time={params.max_time:g}, output_dir={params.output_dir}"
+    )
+    if args.p is not None:
+        print(f"Stopping at {args.p:g}% filled across the whole grid.")
+    sim = ElectrodepositionKMC(params)
+    t0 = time.time()
+    sim.run_cli()
+    t1 = time.time()
+    if args.p is not None:
+        snapshot_path = save_cli_final_snapshot(sim, args.p)
+        print(f"Final percentage snapshot saved to: {snapshot_path}")
+    results_path = append_all_results_row(params, args.p, sim.step, sim.time)
+    print(f"Results row appended to: {results_path}")
+    print(
+        f"Simulation complete at step {sim.step}, "
+        f"time {sim.time:.4e}, wall time {t1 - t0:.2f} s"
+    )
+
+
 if __name__ == "__main__":
-    if USE_SCAN:
+    parser = build_arg_parser()
+    validate_cli_parameter_order(sys.argv[1:], parser)
+    args = parser.parse_args()
+
+    if args.CLI:
+        try:
+            cli_params = params_from_cli_args(args)
+        except ValueError as exc:
+            parser.error(str(exc))
+        run_single_cli(cli_params, args)
+    elif USE_SCAN:
         run_scan(SCAN_FILE, scan_output_dir="scan_output")
     elif USE_GUI:
         root = tk.Tk()
