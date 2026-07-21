@@ -702,11 +702,6 @@
 
             time_ += dt;
             ++step_;
-            #ifdef __EMSCRIPTEN__
-            if (step_ % 10000 == 0) {
-                updateFrontend(step_, time_);
-            }
-            #endif
             return true;
         }
     private:
