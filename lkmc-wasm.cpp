@@ -4,7 +4,7 @@
      * WASM version of C++ port of LKMC_v2_commented_b.py.
      *
      * Build (emscripten sdk needed):
-     * emcc lkmc-wasm.cpp -o public/lkmc-wasm.js -O3 -fexceptions -sEXPORT_ES6 -sMODULARIZE -sEXPORTED_FUNCTIONS="['_set_params', '_init_simulation','_run_steps','_get_lattice','_get_width','_get_height','_get_step','_get_time', '_get_snapshot_json', '_cleanup_simulation']" -sEXPORTED_RUNTIME_METHODS="['ccall','cwrap','UTF8ToString']"
+     * emcc lkmc-wasm.cpp -o public/lkmc-wasm.js -O3 -fexceptions -sEXPORT_ES6 -sMODULARIZE -sEXPORTED_FUNCTIONS="['_set_params', '_init_simulation', '_run_steps', '_get_lattice_data', '_get_lattice_width', '_get_lattice_height', '_get_step', '_get_time', '_cleanup_simulation']" -sEXPORTED_RUNTIME_METHODS="['ccall','cwrap']"
      *
      * Then, you should be able to use this on the web
      * 
