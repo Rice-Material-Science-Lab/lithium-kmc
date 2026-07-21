@@ -703,7 +703,7 @@
             time_ += dt;
             ++step_;
             #ifdef __EMSCRIPTEN__
-            if (step_ % 1000 == 0) {
+            if (step_ % 10000 == 0) {
                 updateFrontend(step_, time_);
             }
             #endif
@@ -1014,7 +1014,7 @@
         }
         update_snapshot_json();
         #ifdef __EMSCRIPTEN__
-            if (wasm_sim->step() % 1000 == 0) {
+            if (wasm_sim->step() % 10000 == 0) {
                 updateFrontend(wasm_sim->step(), wasm_sim->time());
             }
         #endif
