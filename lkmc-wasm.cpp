@@ -907,7 +907,6 @@
     static KMCParams wasm_params = KMCParams{};
 
     static std::string snapshot_json = "";
-    static char* snapshot_json_ptr = nullptr;
     
     void update_snapshot_json() {
 
@@ -939,24 +938,11 @@
         json << "}";
 
         snapshot_json = json.str();
-        if (snapshot_json_ptr) {
-            free(snapshot_json_ptr);
-            snapshot_json_ptr = nullptr;
-        }
-
-        snapshot_json_ptr = (char*)malloc(snapshot_json.size() + 1);
-        if(snapshot_json_ptr) {
-            memcpy(
-                snapshot_json_ptr,
-                snapshot_json.c_str(),
-                snapshot_json.size() + 1
-            );
-        }
     }
 
     EMSCRIPTEN_KEEPALIVE
     const char* get_snapshot_json() {
-        return snapshot_json_ptr;
+        return snapshot_json.c_str();
     }
 
     EMSCRIPTEN_KEEPALIVE
@@ -1052,10 +1038,6 @@
     void cleanup_simulation() {
         delete wasm_sim;
         wasm_sim = nullptr;
-        if(snapshot_json_ptr){
-            free(snapshot_json_ptr);
-            snapshot_json_ptr = nullptr;
-        }
     }
 
     }
