@@ -4,7 +4,7 @@
      * WASM version of C++ port of LKMC_v2_commented_b.py.
      *
      * Build (emscripten sdk needed):
-     * emcc lkmc_wasm.cpp -o public/lkmc-wasm.js -O3 -fexceptions -sEXPORT_ES6 -sMODULARIZE -sEXPORTED_FUNCTIONS="['_init_simulation','_run_steps','_get_lattice','_get_width','_get_height','_get_step','_get_time', '_get_snapshot_json', '_cleanup_simulation']"
+     * emcc lkmc_wasm.cpp -o public/lkmc-wasm.js -O3 -fexceptions -sEXPORT_ES6 -sMODULARIZE -sEXPORTED_FUNCTIONS="['_set_params', '_init_simulation','_run_steps','_get_lattice','_get_width','_get_height','_get_step','_get_time', '_cleanup_simulation']"
      *
      * Then, you should be able to use this on the web
      * 
@@ -906,50 +906,6 @@
     static ElectrodepositionKMC* wasm_sim = nullptr;
     static KMCParams wasm_params = KMCParams{};
 
-    static std::string snapshot_json = "";
-    
-    void update_snapshot_json() {
-
-        if (!wasm_sim) {
-            snapshot_json = "{}";
-            return;
-        }
-
-        std::ostringstream json;
-
-        json << "{";
-        json << "\"step\":" << wasm_sim->step() << ",";
-        json << "\"time\":" << wasm_sim->time() << ",";
-        json << "\"width\":" << wasm_sim->width() << ",";
-        json << "\"height\":" << wasm_sim->height() << ",";
-        json << "\"lattice\":[";
-
-        const int8_t* lattice = wasm_sim->lattice_data();
-        int total = wasm_sim->width() * wasm_sim->height();
-
-        for (int i = 0; i < total; i++) {
-            json << (int)lattice[i];
-
-            if (i != total - 1)
-                json << ",";
-        }
-
-        json << "]";
-        json << "}";
-
-        snapshot_json = json.str();
-    }
-
-    EMSCRIPTEN_KEEPALIVE
-    const char* get_snapshot_json() {
-        return snapshot_json.c_str();
-    }
-
-    EMSCRIPTEN_KEEPALIVE
-    int get_snapshot_json_length() {
-        return snapshot_json.size();
-    }
-
     EMSCRIPTEN_KEEPALIVE
     void set_params(
         int Nx,
@@ -982,7 +938,6 @@
         }
 
         wasm_sim = new ElectrodepositionKMC(wasm_params);
-        update_snapshot_json();
     }
 
     EMSCRIPTEN_KEEPALIVE
@@ -998,7 +953,6 @@
             if (!wasm_sim->execute_step())
                 break;
         }
-        update_snapshot_json();
         #ifdef __EMSCRIPTEN__
             if (wasm_sim->step() % 1000 == 0) {
                 updateFrontend(wasm_sim->step(), wasm_sim->time());
