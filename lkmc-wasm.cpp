@@ -110,116 +110,14 @@ struct PCG64State
         inc_hi   = splitmix64(s);
         inc_lo   = splitmix64(s) | 1ULL;
     }
-    #endif
-    #ifndef __EMSCRIPTEN__
-    namespace fs = std::filesystem;
-    #else
-    namespace fs {
-        struct path {};
-    }
-    #endif
+};
 
-    // ---------------------------------------------------------------------------
-    // PCG64 — identical to numpy.random.default_rng() draw sequence.
-    //
-    // numpy uses PCG64 with a 128-bit LCG and XSL-RR output function.
-    // This class reproduces exactly the same sequence when initialized with
-    // the state/inc extracted from numpy via get_pcg64_state.py.
-    //
-    // Algorithm: advance state via 128-bit LCG, then apply XSL-RR output.
-    //   state = state * MUL + inc  (mod 2^128)
-    //   output = xsl_rr(new_state)  -> top 53 bits -> double in [0,1)
-    //
-    // To get the correct state/inc for a given Python seed, run:
-    //   python3 get_pcg64_state.py <seed>
-    // and paste the printed values into params.cfg as pcg_state_hi, etc.
-    // ---------------------------------------------------------------------------
-    struct PCG64State {
-        uint64_t state_hi = 0x50c3ed493ae78588ULL;  // default: numpy seed=394583
-        uint64_t state_lo = 0x2c8bef01c72f99e5ULL;
-        uint64_t inc_hi   = 0x71a5befeec2f5ccaULL;
-        uint64_t inc_lo   = 0x4df2b37d5d7aa1cbULL;
-    };
-
-    class PCG64 {
-    public:
-        explicit PCG64(const PCG64State& s)
-            : s_hi_(s.state_hi), s_lo_(s.state_lo),
-            i_hi_(s.inc_hi),   i_lo_(s.inc_lo) {}
-
-        double next_double() {
-            advance();
-            return (double)(xsl_rr() >> 11u) * (1.0 / 9007199254740992.0);
-        }
-
-    private:
-        uint64_t s_hi_, s_lo_, i_hi_, i_lo_;
-
-        void advance() {
-            // 128-bit LCG multiplier (same as numpy):
-            // MUL = 0x2360ed051fc65da4_4385df649fccf645
-            __uint128_t s   = ((__uint128_t)s_hi_ << 64) | s_lo_;
-            __uint128_t inc = ((__uint128_t)i_hi_ << 64) | i_lo_;
-            const uint64_t MUL_HI = 0x2360ed051fc65da4ULL;
-            const uint64_t MUL_LO = 0x4385df649fccf645ULL;
-            const __uint128_t MUL =
-                ((__uint128_t)MUL_HI << 64) | (__uint128_t)MUL_LO;
-            s    = s * MUL + inc;
-            s_hi_ = (uint64_t)(s >> 64);
-            s_lo_ = (uint64_t)s;
-        }
-
-        uint64_t xsl_rr() const {
-            uint64_t hi = s_hi_;
-            uint64_t lo = s_lo_;
-
-            uint64_t xorshifted =
-                ((hi ^ lo) >> 32);
-
-            uint32_t rot =
-                hi >> 58;
-
-            return
-                (xorshifted >> rot) |
-                (xorshifted << ((-rot) & 31));
-        }
-    };
-
-    // ---------------------------------------------------------------------------
-    // Lattice state codes
-    // ---------------------------------------------------------------------------
-    constexpr int8_t EMPTY     = 0;
-    constexpr int8_t FREE      = 1;
-    constexpr int8_t DEPOSITED = 2;
-    constexpr int8_t PASSIVATED = 3;
-    constexpr int8_t SUBSTRATE = 4;
-    // ---------------------------------------------------------------------------
-    // Hexagonal lattice neighbour offsets (odd-r horizontal layout)
-    // ---------------------------------------------------------------------------
-
-    static constexpr int EVEN_DX[6] = {
-        1, -1,
-        0, -1,
-        0, -1
-    };
-
-    static constexpr int EVEN_DY[6] = {
-        0,  0,
-        -1, -1,
-        1,  1
-    };
-
-    static constexpr int ODD_DX[6] = {
-        1, -1,
-        1,  0,
-        1,  0
-    };
-
-    static constexpr int ODD_DY[6] = {
-        0,  0,
-        -1, -1,
-        1,  1
-    };
+class PCG64
+{
+public:
+    explicit PCG64(const PCG64State &s)
+        : s_hi_(s.state_hi), s_lo_(s.state_lo),
+          i_hi_(s.inc_hi), i_lo_(s.inc_lo) {}
 
     double next_double()
     {
@@ -227,37 +125,8 @@ struct PCG64State
         return (double)(xsl_rr() >> 11u) * (1.0 / 9007199254740992.0);
     }
 
-    struct KMCParams {
-        int    Nx             = 40;
-        int    Ny             = 25;
-        double T              = 300.0;
-        double d0             = 1.0e3;
-        double e0             = -0.2;
-        double e1             = -0.5;
-        double nu_f           = 5.0e9;
-        double nu_d           = 1.0e9;
-        double nu_p           = 0.0;
-        double kB             = 8.617333262145e-5;  // eV / K
-        int    max_steps      = 400000;
-        double max_time       = 100.0;
-        double stop_fill_fraction = -1.0;
-        int stop_fill_total_sites = 0;
-        int rng_seed = 394583;
-        double concentration = 1.0;
-        double diffusion_rate = 1e-3;
-        bool use_custom_pcg_state = false;
-        
-        // PCG64 state — use get_pcg64_state.py to generate for any numpy seed.
-        // Defaults match numpy.random.default_rng(394583).
-        PCG64State pcg = {};  // default-constructed to seed=394583 values
-        bool   periodic_x     = true;
-        int    log_every      = 1000;
-        int    snapshot_every = 10000;
-        bool   save_snapshots = true;
-        bool   save_npy       = true;
-        std::string output_dir      = "kmc_output";
-        std::string history_filename = "time_series.csv";
-    };
+private:
+    uint64_t s_hi_, s_lo_, i_hi_, i_lo_;
 
     void advance()
     {
@@ -361,70 +230,9 @@ static inline double toDouble(const std::string &s, double def = 0.0)
     {
         return s.empty() ? def : std::stod(s);
     }
-
-    static PCG64State pcg_from_seed(int seed) {
-        // TODO:
-        // Replace with generated numpy PCG64 state.
-        // For now keep deterministic fallback.
-
-        PCG64State s;
-
-        if(seed == 394583)
-        {
-            s.state_hi = 0x50c3ed493ae78588ULL;
-            s.state_lo = 0x2c8bef01c72f99e5ULL;
-            s.inc_hi   = 0x71a5befeec2f5ccaULL;
-            s.inc_lo   = 0x4df2b37d5d7aa1cbULL;
-        }
-
-        return s;
-    }
-
-    KMCParams load_config(const std::string& path, KMCParams p = {}) {
-        std::ifstream f(path);
-        if (!f) throw std::runtime_error("Cannot open config file: " + path);
-        std::string line;
-        while (std::getline(f, line)) {
-            // Strip comments and leading/trailing whitespace.
-            auto hash = line.find('#');
-            if (hash != std::string::npos) line.erase(hash);
-            auto eq = line.find('=');
-            if (eq == std::string::npos) continue;
-            std::string key = line.substr(0, eq);
-            std::string val = line.substr(eq + 1);
-            // Trim whitespace.
-            auto trim = [](std::string& s) {
-                size_t b = s.find_first_not_of(" \t\r\n");
-                size_t e = s.find_last_not_of(" \t\r\n");
-                s = (b == std::string::npos) ? "" : s.substr(b, e - b + 1);
-            };
-            trim(key); trim(val);
-            if (key == "Nx")              p.Nx = toInt(val, p.Nx);
-            else if (key == "Ny")         p.Ny = toInt(val, p.Ny);
-            else if (key == "T")          p.T  = toDouble(val, p.T);
-            else if (key == "d0")         p.d0 = toDouble(val, p.d0);
-            else if (key == "e0")         p.e0 = toDouble(val, p.e0);
-            else if (key == "e1")         p.e1 = toDouble(val, p.e1);
-            else if (key == "nu_f")       p.nu_f = toDouble(val, p.nu_f);
-            else if (key == "nu_d")       p.nu_d = toDouble(val, p.nu_d);
-            else if (key == "max_steps")  p.max_steps = toInt(val, p.max_steps);
-            else if (key == "max_time")   p.max_time = toDouble(val, p.max_time);
-
-            else if (key == "pcg_state_hi") p.pcg.state_hi = toHex(val, p.pcg.state_hi);
-            else if (key == "pcg_state_lo") p.pcg.state_lo = toHex(val, p.pcg.state_lo);
-            else if (key == "pcg_inc_hi")   p.pcg.inc_hi = toHex(val, p.pcg.inc_hi);
-            else if (key == "pcg_inc_lo")   p.pcg.inc_lo = toHex(val, p.pcg.inc_lo);
-
-            else if (key == "periodic_x")    p.periodic_x = (toInt(val, 1) != 0);
-            else if (key == "log_every")     p.log_every = toInt(val, p.log_every);
-            else if (key == "snapshot_every") p.snapshot_every = toInt(val, p.snapshot_every);
-            else if (key == "save_snapshots") p.save_snapshots = (toInt(val, 1) != 0);
-            else if (key == "save_npy")       p.save_npy = (toInt(val, 1) != 0);
-
-            else if (key == "output_dir")    p.output_dir = val;
-            else if (key == "history_file")  p.history_filename = val;
-        }
-        return p;
+    catch (...)
+    {
+        return def;
     }
 }
 
@@ -565,7 +373,7 @@ public:
                 target -= tree_[nxt];
                 idx = nxt;
             }
-            return std::min(idx, size_-1);
+            bit >>= 1;
         }
         return idx; // 0-based
     }
@@ -669,36 +477,22 @@ public:
         return lattice_.data();
     }
 
-    // ---------------------------------------------------------------------------
-    // History record
-    // ---------------------------------------------------------------------------
-    struct HistoryRow {
-        std::string label;
-        int step;
-        double time;
-        int n_free;
-        int n_deposited;
-        int n_passivated;
-        int n_total;
-        double total_rate;
-    };
+    int width() const
+    {
+        return p_.Nx;
+    }
 
-    // ---------------------------------------------------------------------------
-    // Main simulator class (mirrors ElectrodepositionKMC)
-    // ---------------------------------------------------------------------------
-    class ElectrodepositionKMC {
-    public:
-        ~ElectrodepositionKMC() = default;
-        explicit ElectrodepositionKMC(const KMCParams& p)
-            : p_(p),
-            rng_(p.use_custom_pcg_state ? p.pcg : pcg_from_seed(p.rng_seed)),
-            lattice_(p.Ny * p.Nx, EMPTY),
-            num_drop_(p.Nx),
-            num_hop_ (p.Nx * p.Ny * 6),
-            max_events_(p.Nx + p.Nx * p.Ny * 6),
-            event_rates_(p.Nx + p.Nx * p.Ny * 6, 0.0),
-            ftree_(p.Nx + p.Nx * p.Ny * 6),
-            idx_to_event_(p.Nx + p.Nx * p.Ny * 6)
+    int height() const
+    {
+        return p_.Ny;
+    }
+
+    // -----------------------------------------------------------------------
+    // Public API
+    // -----------------------------------------------------------------------
+    void run_cli()
+    {
+        while (step_ < p_.max_steps && time_ < p_.max_time)
         {
 
             if (p_.stop_fill_fraction > 0.0)
@@ -756,25 +550,15 @@ private:
         const int *DX;
         const int *DY;
 
-        int    step() const { return step_; }
-        double time() const { return time_; }
-
-        double fill() {
-            return fill_percentage();
+        if (y & 1)
+        {
+            DX = ODD_DX;
+            DY = ODD_DY;
         }
-
-    private:
-        // -----------------------------------------------------------------------
-        // Lattice access helpers
-        // -----------------------------------------------------------------------
-        int8_t& at(int x, int y)       { return lattice_[y * p_.Nx + x]; }
-        int8_t  at(int x, int y) const { return lattice_[y * p_.Nx + x]; }
-
-        // Wrap x for periodic BC; returns -1 when out of bounds (non-periodic).
-        int wrap_x(int x) const {
-            if (p_.periodic_x) return ((x % p_.Nx) + p_.Nx) % p_.Nx;
-            if (x >= 0 && x < p_.Nx) return x;
-            return -1;
+        else
+        {
+            DX = EVEN_DX;
+            DY = EVEN_DY;
         }
 
         for (int i = 0; i < 6; i++)
@@ -843,16 +627,13 @@ private:
         return e;
     }
 
-        double get_event_rate(const Event& ev) const {
-            if (ev.is_drop) {
-                int x = ev.dx;
-                int y = ev.dy;
-
-                if(at(x,y)!=EMPTY)
-                    return 0.0;
-
-                return p_.d0;
-            }
+    double get_event_rate(const Event &ev) const
+    {
+        if (ev.is_drop)
+        {
+            int x1 = ev.dx, y1 = ev.dy;
+            return (at(x1, y1) == EMPTY) ? p_.d0 : 0.0;
+        }
 
         int x0 = ev.sx, y0 = ev.sy;
         int8_t atype = at(x0, y0);
@@ -874,15 +655,8 @@ private:
         double e_final = calc_local_energy(x1, y1, atype);
         const_cast<ElectrodepositionKMC *>(this)->at(x0, y0) = atype;
 
-            double concentration_factor =
-            p_.concentration;
-
-            return nu *
-                concentration_factor *
-                std::exp(
-                -(e_final-e_init)
-                /(2.0*p_.kB*p_.T));
-        }
+        return nu * std::exp(-(e_final - e_init) / (2.0 * p_.kB * p_.T));
+    }
 
     void update_rate_at(int idx)
     {
@@ -956,38 +730,29 @@ private:
         }
     }
 
-        // -----------------------------------------------------------------------
-        // Bonding-state relaxation (mirrors update_bonding_relaxation)
-        // -----------------------------------------------------------------------
-        int8_t desired_bond_state(int x, int y) const {
-            int8_t st = at(x, y);
-            if (st != FREE && st != DEPOSITED) return st;
-            int bonds = 0;
-            for_each_neighbour(x,y,[&](int nx,int ny){
+    // -----------------------------------------------------------------------
+    // Bonding-state relaxation (mirrors update_bonding_relaxation)
+    // -----------------------------------------------------------------------
+    int8_t desired_bond_state(int x, int y) const
+    {
+        int8_t st = at(x, y);
+        if (st != FREE && st != DEPOSITED)
+            return st;
+        bool bonded = false;
+        for_each_neighbour(x, y, [&](int nx, int ny)
+                           {
+                if (at(nx, ny) == DEPOSITED || at(nx, ny) == SUBSTRATE)
+                    bonded = true; });
+        return bonded ? DEPOSITED : FREE;
+    }
 
-                if(at(nx,ny)==DEPOSITED ||
-                at(nx,ny)==SUBSTRATE)
-                {
-                    bonds++;
-                }
-
-            });
-
-
-            // Passivation rule
-            if(
-                bonds >=6 &&
-                st == DEPOSITED
-            )
-                return PASSIVATED;
-
-
-            if(bonds > 0)
-                return DEPOSITED;
-
-
-            return FREE;
-        }
+    std::vector<std::pair<int, int>> update_bonding_relaxation(
+        const std::vector<std::pair<int, int>> &seeds)
+    {
+        // BFS queue.
+        std::vector<std::pair<int, int>> queue;
+        std::vector<bool> in_queue(p_.Nx * p_.Ny, false);
+        std::vector<std::pair<int, int>> changed;
 
         // Seed with each site and its direct neighbours.
         auto enqueue = [&](int x, int y)
@@ -1032,117 +797,74 @@ private:
         return changed;
     }
 
-        public:
-        // -----------------------------------------------------------------------
-        // KMC step (mirrors execute_step)
-        // -----------------------------------------------------------------------
-        bool execute_step() {
-            double r_tot = ftree_.total();
-            if (r_tot <= 0.0) return false;
-
-            // Time increment.
-            double u1 = std::max(rng_.next_double(), 1.0e-15);
-            double dt  = -std::log(u1) / r_tot;
-
-            // Select event.
-            double u2     = std::max(rng_.next_double(), 1.0e-15);
-            double target = u2 * r_tot;
-            int    idx    = ftree_.find_prefix_index(target);
-
-            const Event& ev = idx_to_event_[idx];
-            changed_buffer_.clear();
-            auto& directly_changed = changed_buffer_;
-
-            if (ev.is_drop) {
-                int x1 = ev.dx, y1 = ev.dy;
-                at(x1, y1) = FREE;
-                directly_changed.emplace_back(x1, y1);
-            } else {
-                int x0 = ev.sx, y0 = ev.sy;
-                int x1 = wrap_x(ev.dx), y1 = ev.dy;
-                int8_t atype = at(x0, y0);
-                at(x0, y0) = EMPTY;
-                at(x1, y1) = atype;
-                directly_changed.emplace_back(x0, y0);
-                directly_changed.emplace_back(x1, y1);
-            }
+public:
+    // -----------------------------------------------------------------------
+    // KMC step (mirrors execute_step)
+    // -----------------------------------------------------------------------
+    bool execute_step()
+    {
+        double r_tot = ftree_.total();
+        if (r_tot <= 0.0)
+            return false;
 
         // Time increment.
         double u1 = std::max(rng_.next_double(), 1.0e-15);
         double dt = -std::log(u1) / r_tot;
 
-            // Merge changed sets.
-            for(auto &v : relaxed)
-            directly_changed.push_back(v);
+        // Select event.
+        double u2 = std::max(rng_.next_double(), 1.0e-15);
+        double target = u2 * r_tot;
+        int idx = ftree_.find_prefix_index(target);
 
-        refresh_local_rates(directly_changed);
+        const Event &ev = idx_to_event_[idx];
+        std::vector<std::pair<int, int>> directly_changed;
 
-            time_ += dt;
-            ++step_;
-            if (step_ % 10000 == 0) {
-                std::cout << std::scientific
-                        << "step=" << step_
-                        << " dt=" << dt
-                        << " time=" << time_
-                        << " r_tot=" << r_tot
-                        << '\n';
-            }
-            return true;
+        if (ev.is_drop)
+        {
+            int x1 = ev.dx, y1 = ev.dy;
+            at(x1, y1) = FREE;
+            directly_changed.emplace_back(x1, y1);
         }
-    private:
-        // -----------------------------------------------------------------------
-        // Output helpers
-        // -----------------------------------------------------------------------
-        struct Counts {
-            int free;
-            int deposited;
-            int passivated;
-            int total;
-        };
-        Counts counts() const {
-            int nf = 0;
-            int nd = 0;
-            int np = 0;
-
-            for(auto v : lattice_) {
-
-                if(v == FREE)
-                    nf++;
-
-                else if(v == DEPOSITED)
-                    nd++;
-
-                else if(v == PASSIVATED)
-                    np++;
-            }
-
-            return {
-                nf,
-                nd,
-                np,
-                nf + nd + np
-            };
+        else
+        {
+            int x0 = ev.sx, y0 = ev.sy;
+            int x1 = wrap_x(ev.dx), y1 = ev.dy;
+            int8_t atype = at(x0, y0);
+            at(x0, y0) = EMPTY;
+            at(x1, y1) = atype;
+            directly_changed.emplace_back(x0, y0);
+            directly_changed.emplace_back(x1, y1);
         }
 
-        double fill_percentage() const {
-            int occupied = 0;
+        auto relaxed = update_bonding_relaxation(directly_changed);
 
-            for(auto v : lattice_)
-            {
-                if(v == FREE ||
-                v == DEPOSITED ||
-                v == PASSIVATED)
-                {
-                    occupied++;
-                }
-            }
+        // Merge changed sets.
+        std::vector<std::pair<int, int>> all_changed = directly_changed;
+        all_changed.insert(all_changed.end(), relaxed.begin(), relaxed.end());
+        refresh_local_rates(all_changed);
 
         time_ += dt;
         ++step_;
         return true;
     }
 
-            return 100.0 * occupied / total_sites;
+private:
+    // -----------------------------------------------------------------------
+    // Output helpers
+    // -----------------------------------------------------------------------
+    struct Counts
+    {
+        int free, dep, total;
+    };
+    Counts counts() const
+    {
+        int nf = 0, nd = 0;
+        for (auto v : lattice_)
+        {
+            if (v == FREE)
+                ++nf;
+            else if (v == DEPOSITED)
+                ++nd;
         }
         return {nf, nd, nf + nd};
     }
@@ -1151,30 +873,16 @@ private:
     {
         int deposited = 0;
 
-        void record_history(const std::string& label) {
-            auto c = counts();
-
-            history_.push_back(
-                {
-                    label,
-                    step_,
-                    time_,
-                    c.free,
-                    c.deposited,
-                    c.passivated,
-                    c.total,
-                    ftree_.total()
-                }
-            );
+        for (auto v : lattice_)
+        {
+            if (v == FREE || v == DEPOSITED)
+                deposited++;
         }
 
         int total_sites = p_.Nx * p_.Ny;
 
-            std::ofstream f(
-                fs::path(p_.output_dir).parent_path()
-                / "AllResults.csv",
-                std::ios::app
-            );
+        return 100.0 * deposited / total_sites;
+    }
 
     void record_history(const std::string &label)
     {
@@ -1233,76 +941,60 @@ private:
               << row.n_total << ','
               << row.total_rate << '\n';
         }
-        
-        #ifndef __EMSCRIPTEN__
-        void write_history_csv() const {
-            fs::path out = out_dir_ / p_.history_filename;
-            std::ofstream f(out);
-            if (!f) throw std::runtime_error("Cannot write history CSV: " + out.string());
-            f << 
-            "label,"
-            "step,"
-            "time,"
-            "free,"
-            "deposited,"
-            "passivated,"
-            "total_occupied,"
-            "total_rate\n";
-            for (const auto& row : history_) {
-                f << row.label    << ','
-                << row.step     << ','
-                << std::scientific << std::setprecision(6) << row.time << ','
-                << row.n_free   << ','
-                << row.n_deposited << ','
-                << row.n_passivated << ','
-                << row.n_total  << ','
-                << row.total_rate << '\n';
-            }
+    }
+#endif
+
+// Write a colour PPM (P6) snapshot scaled up so each lattice cell is CELL_PX pixels.
+// PPM is supported by most image viewers, GIMP, Photoshop, and IrfanView without plugins.
+// Colors: black=EMPTY  steel-blue=FREE  amber=DEPOSITED  dark-grey=SUBSTRATE
+#ifndef __EMSCRIPTEN__
+    void save_snapshot(const std::string &tag) const
+    {
+        const int CELL_PX = std::max(8, std::min(24, 400 / std::max(p_.Nx, p_.Ny)));
+        const int IMG_W = p_.Nx * CELL_PX;
+        const int IMG_H = p_.Ny * CELL_PX;
+
+        fs::path out = out_dir_ / "snapshots" / (tag + ".ppm");
+        std::ofstream f(out, std::ios::binary);
+        if (!f)
+        {
+            std::cerr << "Warning: cannot write snapshot " << out << '\n';
+            return;
         }
-        #endif
 
-        // Write a colour PPM (P6) snapshot scaled up so each lattice cell is CELL_PX pixels.
-        // PPM is supported by most image viewers, GIMP, Photoshop, and IrfanView without plugins.
-        // Colors: black=EMPTY  steel-blue=FREE  amber=DEPOSITED  dark-grey=SUBSTRATE
-        #ifndef __EMSCRIPTEN__
-        void save_snapshot(const std::string& tag) const {
-            const int CELL_PX = std::max(8, std::min(24, 400 / std::max(p_.Nx, p_.Ny)));
-            const int IMG_W   = p_.Nx * CELL_PX;
-            const int IMG_H   = p_.Ny * CELL_PX;
+        // PPM header with metadata comment.
+        f << "P6\n"
+          << "# LKMC | " << tag
+          << " | step=" << step_
+          << " | time=" << std::scientific << std::setprecision(3) << time_
+          << " | T=" << p_.T << "K | Nx=" << p_.Nx << " Ny=" << p_.Ny << "\n"
+          << "# Colors: black=empty  blue=free  orange=deposited  darkgrey=substrate\n"
+          << IMG_W << ' ' << IMG_H << "\n255\n";
 
-            fs::path out = out_dir_ / "snapshots" / (tag + ".ppm");
-            std::ofstream f(out, std::ios::binary);
-            if (!f) { std::cerr << "Warning: cannot write snapshot " << out << '\n'; return; }
+        struct RGB
+        {
+            uint8_t r, g, b;
+        };
+        static const RGB PAL[4] = {
+            {0x11, 0x11, 0x11}, // EMPTY
+            {0x55, 0x99, 0xdd}, // FREE      (steel blue)
+            {0xdd, 0x88, 0x33}, // DEPOSITED (amber)
+            {0x22, 0x22, 0x22}, // SUBSTRATE (dark grey)
+        };
 
-            // PPM header with metadata comment.
-            f << "P6\n"
-            << "# LKMC | " << tag
-            << " | step=" << step_
-            << " | time=" << std::scientific << std::setprecision(3) << time_
-            << " | T=" << p_.T << "K | Nx=" << p_.Nx << " Ny=" << p_.Ny << "\n"
-            << "# Colors: black=empty  blue=free  orange=deposited  darkgrey=substrate\n"
-            << IMG_W << ' ' << IMG_H << "\n255\n";
-
-            struct RGB { uint8_t r, g, b; };
-            static const RGB PAL[5] = {
-                {0x11, 0x11, 0x11},   // EMPTY
-                {0x55, 0x99, 0xdd},   // FREE
-                {0xdd, 0x88, 0x33},   // DEPOSITED
-                {0x88, 0x88, 0x88},   // PASSIVATED
-                {0x22, 0x22, 0x22},   // SUBSTRATE
-            };
-
-            // Write rows top-to-bottom (lattice row 0 = substrate = bottom of image).
-            for (int ly = p_.Ny - 1; ly >= 0; --ly) {
-                std::vector<uint8_t> row_buf(IMG_W * 3);
-                for (int lx = 0; lx < p_.Nx; ++lx) {
-                    const RGB& c = PAL[(uint8_t)at(lx, ly)];
-                    for (int px = 0; px < CELL_PX; ++px) {
-                        int base = (lx * CELL_PX + px) * 3;
-                        row_buf[base + 0] = c.r;
-                        row_buf[base + 1] = c.g;
-                        row_buf[base + 2] = c.b;
-                    }
+        // Write rows top-to-bottom (lattice row 0 = substrate = bottom of image).
+        for (int ly = p_.Ny - 1; ly >= 0; --ly)
+        {
+            std::vector<uint8_t> row_buf(IMG_W * 3);
+            for (int lx = 0; lx < p_.Nx; ++lx)
+            {
+                const RGB &c = PAL[(uint8_t)at(lx, ly)];
+                for (int px = 0; px < CELL_PX; ++px)
+                {
+                    int base = (lx * CELL_PX + px) * 3;
+                    row_buf[base + 0] = c.r;
+                    row_buf[base + 1] = c.g;
+                    row_buf[base + 2] = c.b;
                 }
             }
             for (int py = 0; py < CELL_PX; ++py)
@@ -1329,31 +1021,33 @@ private:
     }
 #endif
 
-        // -----------------------------------------------------------------------
-        // Member data
-        // -----------------------------------------------------------------------
-        KMCParams p_;
-        PCG64 rng_; 
+    void finalize_outputs()
+    {
+        record_history("final");
 
-        std::vector<int8_t>  lattice_;       // [y*Nx + x]
-        double energy_lookup_[5][5];
+#ifndef __EMSCRIPTEN__
+        std::ostringstream tag_stream;
 
-        int num_drop_;
-        int num_hop_;
-        int max_events_;
+        tag_stream
+            << "d" << p_.d0
+            << "T" << p_.T
+            << "e" << p_.e0
+            << "pv" << p_.nu_p
+            << "vf" << p_.nu_f
+            << "vd" << p_.nu_d
+            << "s" << p_.rng_seed
+            << "p" << fill_percentage();
 
-        std::vector<double> event_rates_;
-        FenwickTree         ftree_;
-        std::vector<Event>  idx_to_event_;
+        std::string tag = tag_stream.str();
 
-        double time_ = 0.0;
-        int    step_ = 0;
-        #ifndef __EMSCRIPTEN__
-            fs::path out_dir_;
-        #endif
-        std::vector<std::pair<int,int>> changed_buffer_;
-        std::vector<HistoryRow> history_;
-    };
+        if (p_.save_snapshots)
+            save_snapshot(tag);
+        if (p_.save_npy)
+            save_lattice_npy(tag);
+        write_history_csv();
+        append_results_csv();
+#endif
+    }
 
     // -----------------------------------------------------------------------
     // Member data
@@ -1364,7 +1058,28 @@ private:
     std::vector<int8_t> lattice_; // [y*Nx + x]
     double energy_lookup_[4][4];
 
-    static std::unique_ptr<ElectrodepositionKMC> wasm_sim;
+    int num_drop_;
+    int num_hop_;
+    int max_events_;
+
+    std::vector<double> event_rates_;
+    FenwickTree ftree_;
+    std::vector<Event> idx_to_event_;
+
+    double time_ = 0.0;
+    int step_ = 0;
+#ifndef __EMSCRIPTEN__
+    fs::path out_dir_;
+#endif
+    std::vector<HistoryRow> history_;
+};
+
+#ifdef __EMSCRIPTEN__
+
+extern "C"
+{
+
+    static ElectrodepositionKMC *wasm_sim = nullptr;
     static KMCParams wasm_params = KMCParams{};
 
     EMSCRIPTEN_KEEPALIVE
@@ -1375,7 +1090,6 @@ private:
         double T,
         double e0,
         double e1,
-        double nu_p,
         double nu_f,
         double nu_d,
         int seed)
@@ -1397,12 +1111,13 @@ private:
     void init_simulation()
     {
 
-        if (wasm_sim != nullptr) {
-            wasm_sim.reset();
+        if (wasm_sim != nullptr)
+        {
+            delete wasm_sim;
+            wasm_sim = nullptr;
         }
 
-        wasm_sim =
-        std::make_unique<ElectrodepositionKMC>(wasm_params);
+        wasm_sim = new ElectrodepositionKMC(wasm_params);
     }
 
     EMSCRIPTEN_KEEPALIVE
@@ -1462,16 +1177,8 @@ private:
     }
 
     EMSCRIPTEN_KEEPALIVE
-    int get_lattice_size()
+    int get_width()
     {
-        if(!wasm_sim)
-            return 0;
-
-        return wasm_sim->width()*wasm_sim->height();
-    }
-
-    EMSCRIPTEN_KEEPALIVE
-    int get_width() {
         return wasm_sim ? wasm_sim->width() : 0;
     }
 
@@ -1498,14 +1205,10 @@ private:
     }
 
     EMSCRIPTEN_KEEPALIVE
-    double get_fill() {
-        if (!wasm_sim) return 0.0;
-        return wasm_sim->fill();
-    }
-
-    EMSCRIPTEN_KEEPALIVE
-    void cleanup_simulation() {
-        wasm_sim.reset();
+    void cleanup_simulation()
+    {
+        delete wasm_sim;
+        wasm_sim = nullptr;
     }
 }
 
@@ -1519,149 +1222,58 @@ int main(int argc, char *argv[])
 {
     KMCParams params;
 
-        std::vector<std::string> cli_order;
-
-        for(int i=1;i<argc;i++) {
-            std::string arg = argv[i];
-
-            if(arg.rfind("--",0)==0)
-                cli_order.push_back(arg);
-        }
-
-        std::vector<std::string> expected = {
-            "--d0",
-            "--T",
-            "--e0",
-            "--pv",
-            "--vf",
-            "--vd",
-            "--seed",
-            "--p",
-            "--maxStep",
-            "--maxTime",
-            "--folderName"
-        };
-
-        std::vector<std::string> filtered;
-
-        for(auto& e: expected)
+    for (int i = 1; i < argc; i++)
+    {
+        std::string arg = argv[i];
+        if (arg == "--d0")
         {
-            if(std::find(cli_order.begin(),cli_order.end(),e)
-            != cli_order.end())
-                filtered.push_back(e);
+            params.d0 = std::stod(argv[++i]);
         }
-
-        if(filtered != cli_order)
+        else if (arg == "--T")
         {
-            throw std::invalid_argument(
-                "CLI parameters must appear in this order: "
-                "--d0 --T --e0 --pv --vf --vd --seed --p "
-                "--maxStep --maxTime --folderName"
-            );
+            params.T = std::stod(argv[++i]);
         }
-
-
-        for (int i = 1; i < argc; i++) {
-
-            std::string arg = argv[i];
-
-
-            if(arg=="--d0")
-                params.d0 = std::stod(argv[++i]);
-
-            else if(arg=="--T")
-                params.T = std::stod(argv[++i]);
-
-            else if(arg=="--e0")
-                params.e0 = std::stod(argv[++i]);
-
-            else if(arg=="--pv")
-                params.nu_p = std::stod(argv[++i]);
-
-            else if(arg=="--vf")
-                params.nu_f = std::stod(argv[++i]);
-
-            else if(arg=="--vd")
-                params.nu_d = std::stod(argv[++i]);
-
-            else if(arg=="--seed")
-            {
-                params.rng_seed = std::stoi(argv[++i]);
-            }
-
-            else if(arg=="--p")
-            {
-                double p = std::stod(argv[++i]);
-
-                if(p < 1 || p > 100)
-                    throw std::invalid_argument(
-                        "--p must be between 1 and 100"
-                    );
-
-                params.stop_fill_fraction=p/100.0;
-                params.stop_fill_total_sites=params.Nx*params.Ny;
-            }
-
-            else if(arg=="--maxStep")
-            {
-                std::string v=argv[++i];
-
-                if(v=="BIG")
-                    params.max_steps=INT_MAX;
-                else
-                    params.max_steps=std::stoi(v);
-            }
-
-
-            else if(arg=="--maxTime")
-            {
-                std::string v=argv[++i];
-
-                if(v=="BIG")
-                    params.max_time=INFINITY;
-                else
-                    params.max_time=std::stod(v);
-            }
-
-
-            else if(arg=="--folderName")
-            {
-                params.output_dir =
-                    std::string("kmc_output/")+argv[++i];
-            }
-
-
-            else if(arg=="--config")
-            {
-                params=load_config(argv[++i],params);
-            }
+        else if (arg == "--e0")
+        {
+            params.e0 = std::stod(argv[++i]);
         }
+        else if (arg == "--pv")
+        {
+            params.nu_p = std::stod(argv[++i]);
+        }
+        else if (arg == "--vf")
+        {
+            params.nu_f = std::stod(argv[++i]);
+        }
+        else if (arg == "--vd")
+        {
+            params.nu_d = std::stod(argv[++i]);
+        }
+        else if (arg == "--maxStep")
+        {
+            params.max_steps = std::stoi(argv[++i]);
+        }
+        else if (arg == "--maxTime")
+        {
+            params.max_time = std::stod(argv[++i]);
+        }
+        else if (arg == "--seed")
+        {
+            params.rng_seed = std::stoi(argv[++i]);
+        }
+        else if (arg == "--p")
+        {
+            double percentage = std::stod(argv[++i]);
 
-        std::cout << "LKMC Electrodeposition  (C++ port)\n"
-                << "  Lattice : " << params.Nx << " x " << params.Ny << '\n'
-                << "  T       : " << params.T  << " K\n"
-                << "  d0      : " << params.d0 << "  e0 : " << params.e0
-                << "  e1 : " << params.e1 << '\n'
-                << "  max_steps : " << params.max_steps
-                << "  max_time : " << params.max_time << " s\n"
-                << "  pcg state: " << std::hex << params.pcg.state_hi << "_" << params.pcg.state_lo << std::dec << '\n'
-                << std::flush;
+            if (percentage < 1 || percentage > 100)
+                throw std::invalid_argument("--p must be between 1 and 100");
 
-        auto t0 = std::chrono::steady_clock::now();
-
-        try {
-            ElectrodepositionKMC sim(params);
-            sim.run_cli();
-
-            auto t1   = std::chrono::steady_clock::now();
-            double ws = std::chrono::duration<double>(t1 - t0).count();
-
-            std::cout << "\nDone.  step=" << sim.step()
-                    << "  time=" << std::scientific << std::setprecision(12) << sim.time()
-                    << "  wall=" << std::fixed << std::setprecision(2) << ws << " s\n";
-        } catch (const std::exception& e) {
-            std::cerr << "Simulation error: " << e.what() << '\n';
-            return 1;
+            params.stop_fill_fraction = percentage / 100.0;
+            params.stop_fill_total_sites = params.Nx * params.Ny;
+        }
+        else if (arg == "--config")
+        {
+            params = load_config(argv[++i], params);
         }
     }
 
