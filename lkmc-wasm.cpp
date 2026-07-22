@@ -1086,7 +1086,7 @@
         }
         #ifdef __EMSCRIPTEN__
             if (wasm_sim->step() % 10000 == 0) {
-                updateFrontend(wasm_sim->step(), wasm_sim->time());
+                updateFrontend(wasm_sim->step());
             }
         #endif
     }
