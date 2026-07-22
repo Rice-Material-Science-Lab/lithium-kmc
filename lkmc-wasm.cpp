@@ -4,7 +4,7 @@
  * WASM version of C++ port of LKMC_v2_commented_b.py.
  *
  * Build (emscripten sdk needed):
- * emcc lkmc-wasm.cpp -o public/lkmc-wasm.js -O3 -fexceptions -sEXPORT_ES6 -sMODULARIZE -sEXPORTED_FUNCTIONS="['_set_params', '_init_simulation', '_run_steps', '_get_lattice_data', '_get_lattice_width', '_get_lattice_height', '_get_step', '_get_time', '_cleanup_simulation']" -sEXPORTED_RUNTIME_METHODS="['ccall','cwrap']"
+ * emcc lkmc-wasm.cpp -o public/lkmc-wasm.js -O3 -fexceptions -sEXPORT_ES6 -sMODULARIZE -sEXPORTED_FUNCTIONS="['_set_params', '_init_simulation', '_run_steps', '_get_lattice_data', '_get_width', '_get_height', '_get_step', '_get_time', '_cleanup_simulation']" -sEXPORTED_RUNTIME_METHODS="['ccall','cwrap', 'HEAP8']"
  *
  * Then, you should be able to use this on the web
  *
@@ -1107,7 +1107,10 @@ extern "C"
     void run_steps(int steps)
     {
         if (!wasm_sim)
+        {
+            printf("CRITICAL ERROR: wasm_sim is NULL at the start of run_steps!\n");
             return;
+        }
 
         int max_batch = 5000;
         if (steps > max_batch)
@@ -1115,16 +1118,32 @@ extern "C"
 
         for (int i = 0; i < steps; i++)
         {
-            if (!wasm_sim->execute_step())
+            bool success = false;
+            try
+            {
+                success = wasm_sim->execute_step();
+            }
+            catch (...)
+            {
+                printf("CRITICAL ERROR: Exception thrown inside execute_step()!\n");
+                break;
+            }
+
+            if (!success)
                 break;
         }
 
-        // update_snapshot_json(); <-- REMOVE THIS
-
 #ifdef __EMSCRIPTEN__
-        if (wasm_sim->step() % 10000 == 0)
+        if (wasm_sim != nullptr)
         {
-            updateFrontend(wasm_sim->step(), wasm_sim->time());
+            if (wasm_sim->step() % 10000 == 0)
+            {
+                updateFrontend(wasm_sim->step(), wasm_sim->time());
+            }
+        }
+        else
+        {
+            printf("CRITICAL ERROR: wasm_sim became NULL right before updateFrontend!\n");
         }
 #endif
     }
@@ -1132,11 +1151,12 @@ extern "C"
     EMSCRIPTEN_KEEPALIVE
     const int8_t *get_lattice_data()
     {
-        if (wasm_sim)
+        if (!wasm_sim)
         {
-            return wasm_sim->lattice_data();
+            printf("CRITICAL ERROR: wasm_sim is NULL during get_lattice_data!\n");
+            return nullptr;
         }
-        return nullptr;
+        return wasm_sim->lattice_data();
     }
 
     EMSCRIPTEN_KEEPALIVE
