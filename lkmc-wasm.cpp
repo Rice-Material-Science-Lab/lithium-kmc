@@ -4,7 +4,7 @@
      * WASM version of C++ port of LKMC_v2_commented_b.py.
      *
      * Build (emscripten sdk needed):
-     * emcc lkmc-wasm.cpp -o public/lkmc-wasm.js -O3 -fexceptions -sEXPORT_ES6 -sMODULARIZE -sEXPORTED_FUNCTIONS="['_set_params', '_init_simulation','_run_steps','_get_lattice','_get_width','_get_height','_get_step','_get_time', '_get_snapshot_json', '_cleanup_simulation']" -sEXPORTED_RUNTIME_METHODS="['ccall','cwrap','UTF8ToString']"
+     * emcc lkmc-wasm.cpp -o public/lkmc-wasm.js -O3 -fexceptions -sEXPORT_ES6 -sMODULARIZE -sEXPORTED_FUNCTIONS="['_set_params','_get_fill','_get_lattice_size','_init_simulation','_run_steps','_get_lattice','_get_width','_get_height','_get_step','_get_time','_cleanup_simulation']" -sEXPORTED_RUNTIME_METHODS="['ccall','cwrap','UTF8ToString']"
      *
      * Then, you should be able to use this on the web
      * 
@@ -50,6 +50,7 @@
     #include <iomanip>
     #include <iostream>
     #include <map>
+    #include <memory>
     #include <optional>
     #include <queue>
     #include <random>
@@ -70,6 +71,10 @@
     #endif
     #ifndef __EMSCRIPTEN__
     namespace fs = std::filesystem;
+    #else
+    namespace fs {
+        struct path {};
+    }
     #endif
 
     // ---------------------------------------------------------------------------
@@ -123,9 +128,18 @@
         }
 
         uint64_t xsl_rr() const {
-            uint64_t xsl = s_hi_ ^ s_lo_;
-            uint32_t rot = (uint32_t)(s_hi_ >> 58u);
-            return (xsl >> rot) | (xsl << ((-rot) & 63u));
+            uint64_t hi = s_hi_;
+            uint64_t lo = s_lo_;
+
+            uint64_t xorshifted =
+                ((hi ^ lo) >> 32);
+
+            uint32_t rot =
+                hi >> 58;
+
+            return
+                (xorshifted >> rot) |
+                (xorshifted << ((-rot) & 31));
         }
     };
 
@@ -135,7 +149,8 @@
     constexpr int8_t EMPTY     = 0;
     constexpr int8_t FREE      = 1;
     constexpr int8_t DEPOSITED = 2;
-    constexpr int8_t SUBSTRATE = 3;
+    constexpr int8_t PASSIVATED = 3;
+    constexpr int8_t SUBSTRATE = 4;
     // ---------------------------------------------------------------------------
     // Hexagonal lattice neighbour offsets (odd-r horizontal layout)
     // ---------------------------------------------------------------------------
@@ -181,6 +196,10 @@
         double stop_fill_fraction = -1.0;
         int stop_fill_total_sites = 0;
         int rng_seed = 394583;
+        double concentration = 1.0;
+        double diffusion_rate = 1e-3;
+        bool use_custom_pcg_state = false;
+        
         // PCG64 state — use get_pcg64_state.py to generate for any numpy seed.
         // Defaults match numpy.random.default_rng(394583).
         PCG64State pcg = {};  // default-constructed to seed=394583 values
@@ -208,6 +227,25 @@
         try { return s.empty() ? def : std::stoull(s, nullptr, 16); }
         catch (...) { return def; }
     }
+
+    static PCG64State pcg_from_seed(int seed) {
+        // TODO:
+        // Replace with generated numpy PCG64 state.
+        // For now keep deterministic fallback.
+
+        PCG64State s;
+
+        if(seed == 394583)
+        {
+            s.state_hi = 0x50c3ed493ae78588ULL;
+            s.state_lo = 0x2c8bef01c72f99e5ULL;
+            s.inc_hi   = 0x71a5befeec2f5ccaULL;
+            s.inc_lo   = 0x4df2b37d5d7aa1cbULL;
+        }
+
+        return s;
+    }
+
     KMCParams load_config(const std::string& path, KMCParams p = {}) {
         std::ifstream f(path);
         if (!f) throw std::runtime_error("Cannot open config file: " + path);
@@ -296,7 +334,7 @@
                 }
                 bit >>= 1;
             }
-            return idx;  // 0-based
+            return std::min(idx, size_-1);
         }
 
     private:
@@ -318,11 +356,12 @@
     // ---------------------------------------------------------------------------
     struct HistoryRow {
         std::string label;
-        int    step;
+        int step;
         double time;
-        int    n_free;
-        int    n_deposited;
-        int    n_total;
+        int n_free;
+        int n_deposited;
+        int n_passivated;
+        int n_total;
         double total_rate;
     };
 
@@ -334,7 +373,7 @@
         ~ElectrodepositionKMC() = default;
         explicit ElectrodepositionKMC(const KMCParams& p)
             : p_(p),
-            rng_(p.pcg),
+            rng_(p.use_custom_pcg_state ? p.pcg : pcg_from_seed(p.rng_seed)),
             lattice_(p.Ny * p.Nx, EMPTY),
             num_drop_(p.Nx),
             num_hop_ (p.Nx * p.Ny * 6),
@@ -427,6 +466,10 @@
         int    step() const { return step_; }
         double time() const { return time_; }
 
+        double fill() {
+            return fill_percentage();
+        }
+
     private:
         // -----------------------------------------------------------------------
         // Lattice access helpers
@@ -518,8 +561,13 @@
 
         double get_event_rate(const Event& ev) const {
             if (ev.is_drop) {
-                int x1 = ev.dx, y1 = ev.dy;
-                return (at(x1, y1) == EMPTY) ? p_.d0 : 0.0;
+                int x = ev.dx;
+                int y = ev.dy;
+
+                if(at(x,y)!=EMPTY)
+                    return 0.0;
+
+                return p_.d0;
             }
 
             int x0 = ev.sx, y0 = ev.sy;
@@ -539,7 +587,14 @@
             double e_final = calc_local_energy(x1, y1, atype);
             const_cast<ElectrodepositionKMC*>(this)->at(x0, y0) = atype;
 
-            return nu * std::exp(-(e_final - e_init) / (2.0 * p_.kB * p_.T));
+            double concentration_factor =
+            p_.concentration;
+
+            return nu *
+                concentration_factor *
+                std::exp(
+                -(e_final-e_init)
+                /(2.0*p_.kB*p_.T));
         }
 
         void update_rate_at(int idx) {
@@ -611,12 +666,31 @@
         int8_t desired_bond_state(int x, int y) const {
             int8_t st = at(x, y);
             if (st != FREE && st != DEPOSITED) return st;
-            bool bonded = false;
-            for_each_neighbour(x, y, [&](int nx, int ny) {
-                if (at(nx, ny) == DEPOSITED || at(nx, ny) == SUBSTRATE)
-                    bonded = true;
+            int bonds = 0;
+            for_each_neighbour(x,y,[&](int nx,int ny){
+
+                if(at(nx,ny)==DEPOSITED ||
+                at(nx,ny)==SUBSTRATE)
+                {
+                    bonds++;
+                }
+
             });
-            return bonded ? DEPOSITED : FREE;
+
+
+            // Passivation rule
+            if(
+                bonds >=6 &&
+                st == DEPOSITED
+            )
+                return PASSIVATED;
+
+
+            if(bonds > 0)
+                return DEPOSITED;
+
+
+            return FREE;
         }
 
         std::vector<std::pair<int,int>> update_bonding_relaxation(
@@ -677,7 +751,8 @@
             int    idx    = ftree_.find_prefix_index(target);
 
             const Event& ev = idx_to_event_[idx];
-            std::vector<std::pair<int,int>> directly_changed;
+            changed_buffer_.clear();
+            auto& directly_changed = changed_buffer_;
 
             if (ev.is_drop) {
                 int x1 = ev.dx, y1 = ev.dy;
@@ -696,51 +771,100 @@
             auto relaxed = update_bonding_relaxation(directly_changed);
 
             // Merge changed sets.
-            std::vector<std::pair<int,int>> all_changed = directly_changed;
-            all_changed.insert(all_changed.end(), relaxed.begin(), relaxed.end());
-            refresh_local_rates(all_changed);
+            for(auto &v : relaxed)
+            directly_changed.push_back(v);
+
+        refresh_local_rates(directly_changed);
 
             time_ += dt;
             ++step_;
+            if (step_ % 10000 == 0) {
+                std::cout << std::scientific
+                        << "step=" << step_
+                        << " dt=" << dt
+                        << " time=" << time_
+                        << " r_tot=" << r_tot
+                        << '\n';
+            }
             return true;
         }
     private:
         // -----------------------------------------------------------------------
         // Output helpers
         // -----------------------------------------------------------------------
-        struct Counts { int free, dep, total; };
+        struct Counts {
+            int free;
+            int deposited;
+            int passivated;
+            int total;
+        };
         Counts counts() const {
-            int nf = 0, nd = 0;
-            for (auto v : lattice_) {
-                if (v == FREE)      ++nf;
-                else if (v == DEPOSITED) ++nd;
+            int nf = 0;
+            int nd = 0;
+            int np = 0;
+
+            for(auto v : lattice_) {
+
+                if(v == FREE)
+                    nf++;
+
+                else if(v == DEPOSITED)
+                    nd++;
+
+                else if(v == PASSIVATED)
+                    np++;
             }
-            return {nf, nd, nf + nd};
+
+            return {
+                nf,
+                nd,
+                np,
+                nf + nd + np
+            };
         }
 
         double fill_percentage() const {
-            int deposited = 0;
+            int occupied = 0;
 
-            for (auto v : lattice_) {
-                if (v == FREE || v == DEPOSITED)
-                    deposited++;
+            for(auto v : lattice_)
+            {
+                if(v == FREE ||
+                v == DEPOSITED ||
+                v == PASSIVATED)
+                {
+                    occupied++;
+                }
             }
 
             int total_sites = p_.Nx * p_.Ny;
 
-            return 100.0 * deposited / total_sites;
+            return 100.0 * occupied / total_sites;
         }
 
         void record_history(const std::string& label) {
-            auto [nf, nd, nt] = counts();
-            double tr = 0.0;
-            for (double r : event_rates_) tr += r;
-            history_.push_back({label, step_, time_, nf, nd, nt, tr});
+            auto c = counts();
+
+            history_.push_back(
+                {
+                    label,
+                    step_,
+                    time_,
+                    c.free,
+                    c.deposited,
+                    c.passivated,
+                    c.total,
+                    ftree_.total()
+                }
+            );
         }
 
         void append_results_csv() {
 
-            std::ofstream f("AllResults.csv", std::ios::app);
+            std::ofstream f(
+                fs::path(p_.output_dir).parent_path()
+                / "AllResults.csv",
+                std::ios::app
+            );
 
             if (!f) {
                 throw std::runtime_error("Cannot open AllResults.csv");
@@ -770,13 +894,22 @@
             fs::path out = out_dir_ / p_.history_filename;
             std::ofstream f(out);
             if (!f) throw std::runtime_error("Cannot write history CSV: " + out.string());
-            f << "label,step,time,free,deposited,total_mobile_plus_deposited,total_rate\n";
+            f << 
+            "label,"
+            "step,"
+            "time,"
+            "free,"
+            "deposited,"
+            "passivated,"
+            "total_occupied,"
+            "total_rate\n";
             for (const auto& row : history_) {
                 f << row.label    << ','
                 << row.step     << ','
                 << std::scientific << std::setprecision(6) << row.time << ','
                 << row.n_free   << ','
                 << row.n_deposited << ','
+                << row.n_passivated << ','
                 << row.n_total  << ','
                 << row.total_rate << '\n';
             }
@@ -806,11 +939,12 @@
             << IMG_W << ' ' << IMG_H << "\n255\n";
 
             struct RGB { uint8_t r, g, b; };
-            static const RGB PAL[4] = {
+            static const RGB PAL[5] = {
                 {0x11, 0x11, 0x11},   // EMPTY
-                {0x55, 0x99, 0xdd},   // FREE      (steel blue)
-                {0xdd, 0x88, 0x33},   // DEPOSITED (amber)
-                {0x22, 0x22, 0x22},   // SUBSTRATE (dark grey)
+                {0x55, 0x99, 0xdd},   // FREE
+                {0xdd, 0x88, 0x33},   // DEPOSITED
+                {0x88, 0x88, 0x88},   // PASSIVATED
+                {0x22, 0x22, 0x22},   // SUBSTRATE
             };
 
             // Write rows top-to-bottom (lattice row 0 = substrate = bottom of image).
@@ -876,7 +1010,7 @@
         PCG64 rng_; 
 
         std::vector<int8_t>  lattice_;       // [y*Nx + x]
-        double energy_lookup_[4][4];
+        double energy_lookup_[5][5];
 
         int num_drop_;
         int num_hop_;
@@ -891,6 +1025,7 @@
         #ifndef __EMSCRIPTEN__
             fs::path out_dir_;
         #endif
+        std::vector<std::pair<int,int>> changed_buffer_;
         std::vector<HistoryRow> history_;
     };
 
@@ -898,7 +1033,7 @@
 
     extern "C" {
 
-    static ElectrodepositionKMC* wasm_sim = nullptr;
+    static std::unique_ptr<ElectrodepositionKMC> wasm_sim;
     static KMCParams wasm_params = KMCParams{};
 
     EMSCRIPTEN_KEEPALIVE
@@ -909,6 +1044,7 @@
         double T,
         double e0,
         double e1,
+        double nu_p,
         double nu_f,
         double nu_d,
         int seed)
@@ -928,11 +1064,11 @@
     void init_simulation() {
 
         if (wasm_sim != nullptr) {
-            delete wasm_sim;
-            wasm_sim = nullptr;
+            wasm_sim.reset();
         }
 
-        wasm_sim = new ElectrodepositionKMC(wasm_params);
+        wasm_sim =
+        std::make_unique<ElectrodepositionKMC>(wasm_params);
     }
 
     EMSCRIPTEN_KEEPALIVE
@@ -962,6 +1098,15 @@
     }
 
     EMSCRIPTEN_KEEPALIVE
+    int get_lattice_size()
+    {
+        if(!wasm_sim)
+            return 0;
+
+        return wasm_sim->width()*wasm_sim->height();
+    }
+
+    EMSCRIPTEN_KEEPALIVE
     int get_width() {
         return wasm_sim ? wasm_sim->width() : 0;
     }
@@ -984,9 +1129,14 @@
     }
 
     EMSCRIPTEN_KEEPALIVE
+    double get_fill() {
+        if (!wasm_sim) return 0.0;
+        return wasm_sim->fill();
+    }
+
+    EMSCRIPTEN_KEEPALIVE
     void cleanup_simulation() {
-        delete wasm_sim;
-        wasm_sim = nullptr;
+        wasm_sim.reset();
     }
 
     }
@@ -1000,46 +1150,121 @@
     int main(int argc, char* argv[]) {
         KMCParams params;
 
-        for (int i = 1; i < argc; i++) {
+        std::vector<std::string> cli_order;
+
+        for(int i=1;i<argc;i++) {
             std::string arg = argv[i];
-            if (arg == "--d0") {
+
+            if(arg.rfind("--",0)==0)
+                cli_order.push_back(arg);
+        }
+
+        std::vector<std::string> expected = {
+            "--d0",
+            "--T",
+            "--e0",
+            "--pv",
+            "--vf",
+            "--vd",
+            "--seed",
+            "--p",
+            "--maxStep",
+            "--maxTime",
+            "--folderName"
+        };
+
+        std::vector<std::string> filtered;
+
+        for(auto& e: expected)
+        {
+            if(std::find(cli_order.begin(),cli_order.end(),e)
+            != cli_order.end())
+                filtered.push_back(e);
+        }
+
+        if(filtered != cli_order)
+        {
+            throw std::invalid_argument(
+                "CLI parameters must appear in this order: "
+                "--d0 --T --e0 --pv --vf --vd --seed --p "
+                "--maxStep --maxTime --folderName"
+            );
+        }
+
+
+        for (int i = 1; i < argc; i++) {
+
+            std::string arg = argv[i];
+
+
+            if(arg=="--d0")
                 params.d0 = std::stod(argv[++i]);
-            }
-            else if (arg == "--T") {
+
+            else if(arg=="--T")
                 params.T = std::stod(argv[++i]);
-            }
-            else if (arg == "--e0") {
+
+            else if(arg=="--e0")
                 params.e0 = std::stod(argv[++i]);
-            }
-            else if (arg == "--pv") {
+
+            else if(arg=="--pv")
                 params.nu_p = std::stod(argv[++i]);
-            }
-            else if (arg == "--vf") {
+
+            else if(arg=="--vf")
                 params.nu_f = std::stod(argv[++i]);
-            }
-            else if (arg == "--vd") {
+
+            else if(arg=="--vd")
                 params.nu_d = std::stod(argv[++i]);
-            }
-            else if (arg == "--maxStep") {
-                params.max_steps = std::stoi(argv[++i]);
-            }
-            else if (arg == "--maxTime") {
-                params.max_time = std::stod(argv[++i]);
-            }
-            else if (arg == "--seed") {
+
+            else if(arg=="--seed")
+            {
                 params.rng_seed = std::stoi(argv[++i]);
             }
-            else if (arg == "--p") {
-                double percentage = std::stod(argv[++i]);
 
-                if (percentage < 1 || percentage > 100)
-                    throw std::invalid_argument("--p must be between 1 and 100");
+            else if(arg=="--p")
+            {
+                double p = std::stod(argv[++i]);
 
-                params.stop_fill_fraction = percentage / 100.0;
-                params.stop_fill_total_sites = params.Nx * params.Ny;
+                if(p < 1 || p > 100)
+                    throw std::invalid_argument(
+                        "--p must be between 1 and 100"
+                    );
+
+                params.stop_fill_fraction=p/100.0;
+                params.stop_fill_total_sites=params.Nx*params.Ny;
             }
-            else if (arg == "--config") {
-                params = load_config(argv[++i], params);
+
+            else if(arg=="--maxStep")
+            {
+                std::string v=argv[++i];
+
+                if(v=="BIG")
+                    params.max_steps=INT_MAX;
+                else
+                    params.max_steps=std::stoi(v);
+            }
+
+
+            else if(arg=="--maxTime")
+            {
+                std::string v=argv[++i];
+
+                if(v=="BIG")
+                    params.max_time=INFINITY;
+                else
+                    params.max_time=std::stod(v);
+            }
+
+
+            else if(arg=="--folderName")
+            {
+                params.output_dir =
+                    std::string("kmc_output/")+argv[++i];
+            }
+
+
+            else if(arg=="--config")
+            {
+                params=load_config(argv[++i],params);
             }
         }
 
@@ -1063,7 +1288,7 @@
             double ws = std::chrono::duration<double>(t1 - t0).count();
 
             std::cout << "\nDone.  step=" << sim.step()
-                    << "  time=" << std::scientific << std::setprecision(4) << sim.time()
+                    << "  time=" << std::scientific << std::setprecision(12) << sim.time()
                     << "  wall=" << std::fixed << std::setprecision(2) << ws << " s\n";
         } catch (const std::exception& e) {
             std::cerr << "Simulation error: " << e.what() << '\n';
