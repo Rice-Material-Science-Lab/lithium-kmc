@@ -3,7 +3,7 @@ name: Compile WASM and Push to Website
 on:
   push:
     branches:
-      - main
+      - '**'
   workflow_dispatch:
 
 jobs:
@@ -21,9 +21,11 @@ jobs:
 
       - name: Compile C++ to WASM
         run: |
-          emcc lkmc.cpp -o public/lkmc-wasm.js -s EXPORT_ES6=1 -s MODULARIZE=1 -s EXPORTED_RUNTIME_METHODS="['ccall','cwrap']" -s EXPORTED_FUNCTIONS="['_init_simulation','_run_steps','_get_step','_get_time','_cleanup_simulation','_main']" -O3
+          mkdir -p public
+          emcc lkmc-wasm.cpp -o public/lkmc-wasm.js -O3 -fexceptions -sEXPORT_ES6 -sMODULARIZE -sEXPORTED_FUNCTIONS="['_set_params', '_init_simulation', '_run_steps', '_get_lattice', '_get_width', '_get_height', '_get_step', '_get_time', '_cleanup_simulation']" -sEXPORTED_RUNTIME_METHODS="['ccall','cwrap', 'HEAP8', 'wasmMemory']"
 
       - name: Push Build Artifacts to Destination Repo
+        if: github.ref == 'refs/heads/main'
         env:
           DEST_PAT: ${{ secrets.UPDATE_WASM_PAT }}
         run: |
@@ -32,8 +34,8 @@ jobs:
 
           # Copy js and wasm files into the public folder
           mkdir -p dest-repo/public/
-          cp lkmc-wasm.js dest-repo/public/
-          cp lkmc-wasm.wasm dest-repo/public/
+          cp public/lkmc-wasm.js dest-repo/public/
+          cp public/lkmc-wasm.wasm dest-repo/public/
 
           # Commit and push changes
           cd dest-repo
