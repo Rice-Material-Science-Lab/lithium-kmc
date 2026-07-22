@@ -71,10 +71,6 @@
     #endif
     #ifndef __EMSCRIPTEN__
     namespace fs = std::filesystem;
-    #else
-    namespace fs {
-        struct path {};
-    }
     #endif
 
     // ---------------------------------------------------------------------------
@@ -858,13 +854,13 @@
             );
         }
 
+        #ifndef __EMSCRIPTEN__
         void append_results_csv() {
 
-            std::ofstream f(
-                fs::path(p_.output_dir).parent_path()
-                / "AllResults.csv",
-                std::ios::app
-            );
+             fs::path out = fs::path(p_.output_dir).parent_path()
+                  / "AllResults.csv";
+
+            std::ofstream f(out, std::ios::app);
 
             if (!f) {
                 throw std::runtime_error("Cannot open AllResults.csv");
@@ -888,6 +884,7 @@
             << time_
             << "\n";
         }
+        #endif
         
         #ifndef __EMSCRIPTEN__
         void write_history_csv() const {
