@@ -62,10 +62,10 @@
 #include <emscripten.h>
 extern "C"
 {
-    EM_JS(void, updateFrontend, (int step, double time), {
+    EM_JS(void, updateFrontend, (int step), {
         if (typeof window.updateSimulation === "function")
         {
-            window.updateSimulation(step, time);
+            window.updateSimulation(step);
         }
     });
 }
@@ -1138,7 +1138,7 @@ extern "C"
         {
             if (wasm_sim->step() % 10000 == 0)
             {
-                updateFrontend(wasm_sim->step(), wasm_sim->time());
+                updateFrontend(wasm_sim->step());
             }
         }
         else
