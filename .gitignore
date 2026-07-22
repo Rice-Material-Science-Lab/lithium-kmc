@@ -9,3 +9,20 @@ scan_params.txt
 lkmc-wasm.wasm
 
 lkmc-wasm.jskmc_output/
+
+.DS_Store
+
+.vscode/
+
+*.o
+*.out
+lkmc
+null.o
+
+kmc_output/
+*.bin
+*.ppm
+time_series.csv
+AllResults.csv
+
+*.wasm
