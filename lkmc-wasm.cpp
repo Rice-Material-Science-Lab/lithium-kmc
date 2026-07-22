@@ -4,7 +4,7 @@
  * WASM version of C++ port of LKMC_v2_commented_b.py.
  *
  * Build (emscripten sdk needed):
- * emcc lkmc-wasm.cpp -o public/lkmc-wasm.js -O3 -fexceptions -sEXPORT_ES6 -sMODULARIZE -sEXPORTED_FUNCTIONS="['_set_params', '_init_simulation', '_run_steps', '_get_lattice_data', '_get_width', '_get_height', '_get_step', '_get_time', '_cleanup_simulation']" -sEXPORTED_RUNTIME_METHODS="['ccall','cwrap', 'HEAP8']"
+ * emcc lkmc-wasm.cpp -o public/lkmc-wasm.js -O3 -fexceptions -sEXPORT_ES6 -sMODULARIZE -sEXPORTED_FUNCTIONS="['_set_params', '_init_simulation', '_run_steps', '_get_lattice_data', '_get_width', '_get_height', '_get_step', '_get_time', '_cleanup_simulation']" -sEXPORTED_RUNTIME_METHODS="['ccall','cwrap', 'HEAP8', 'wasmMemory']"
  *
  * Then, you should be able to use this on the web
  *
@@ -95,6 +95,21 @@ struct PCG64State
     uint64_t state_lo = 0x2c8bef01c72f99e5ULL;
     uint64_t inc_hi = 0x71a5befeec2f5ccaULL;
     uint64_t inc_lo = 0x4df2b37d5d7aa1cbULL;
+
+    // expand passed int into 256 bits needed
+    void seed(uint64_t s) {
+        auto splitmix64 = [](uint64_t& state) -> uint64_t {
+            uint64_t z = (state += 0x9e3779b97f4a7c15ULL);
+            z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
+            z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
+            return z ^ (z >> 31);
+        };
+        
+        state_hi = splitmix64(s);
+        state_lo = splitmix64(s);
+        inc_hi   = splitmix64(s);
+        inc_lo   = splitmix64(s) | 1ULL;
+    }
 };
 
 class PCG64
@@ -1088,6 +1103,8 @@ extern "C"
         wasm_params.nu_f = nu_f;
         wasm_params.nu_d = nu_d;
         wasm_params.rng_seed = seed;
+
+        wasm_params.pcg.seed((uint64_t)seed);
     }
 
     EMSCRIPTEN_KEEPALIVE
