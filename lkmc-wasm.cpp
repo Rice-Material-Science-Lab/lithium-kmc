@@ -4,8 +4,7 @@
  * WASM version of C++ port of LKMC_v2_commented_b.py.
  *
  *  * Build:
- * emcc lkmc-wasm.cpp -o public/lkmc-wasm.js -O3 -fexceptions -sEXPORT_ES6 -sMODULARIZE -sEXPORTED_FUNCTIONS="['_set_params','_init_simulation','_run_steps','_get_lattice_data','_get_width','_get_height','_get_step','_get_time','_get_fill','_cleanup_simulation']" -sEXPORTED_RUNTIME_METHODS="['ccall','cwrap','HEAP8','wasmMemory']"
- *
+ * emcc lkmc-wasm.cpp -o public/lkmc-wasm.js -O3 -fexceptions -sEXPORT_ES6 -sMODULARIZE -sEXPORTED_FUNCTIONS="['_set_params','_init_simulation','_run_steps','_get_lattice_data','_get_lattice','_get_lattice_size','_get_width','_get_height','_get_step','_get_time','_get_fill','_get_passivated','_cleanup_simulation']" -sEXPORTED_RUNTIME_METHODS="['ccall','cwrap','HEAP8','wasmMemory']"
  * Exported WASM stuff:
  *   _set_params(int Nx, int Ny, double d0, double T, double e0, double e1, double nu_f, double nu_d, int seed)
  *   _init_simulation()
@@ -170,6 +169,7 @@ constexpr int8_t EMPTY = 0;
 constexpr int8_t FREE = 1;
 constexpr int8_t DEPOSITED = 2;
 constexpr int8_t SUBSTRATE = 3;
+constexpr int8_t PASSIVATED = 4;
 // ---------------------------------------------------------------------------
 // Hexagonal lattice neighbour offsets (odd-r horizontal layout)
 // ---------------------------------------------------------------------------
@@ -204,7 +204,8 @@ struct KMCParams
     double e1 = -0.5;
     double nu_f = 5.0e9;
     double nu_d = 1.0e9;
-    double nu_p = 0.0;
+    double nu_p = 1.0e6;          // passivation attempt frequency
+    double E_pass = 0.25;         // passivation activation barrier (eV)
     double kB = 8.617333262145e-5; // eV / K
     int max_steps = 400000;
     double max_time = 100.0;
@@ -301,6 +302,10 @@ KMCParams load_config(const std::string &path, KMCParams p = {})
             p.nu_f = toDouble(val, p.nu_f);
         else if (key == "nu_d")
             p.nu_d = toDouble(val, p.nu_d);
+        else if (key == "nu_p")
+            p.nu_p = toDouble(val, p.nu_p);
+        else if (key == "E_pass")
+            p.E_pass = toDouble(val, p.E_pass);
         else if (key == "max_steps")
             p.max_steps = toInt(val, p.max_steps);
         else if (key == "max_time")
@@ -432,10 +437,10 @@ public:
           lattice_(p.Ny * p.Nx, EMPTY),
           num_drop_(p.Nx),
           num_hop_(p.Nx * p.Ny * 6),
-          max_events_(p.Nx + p.Nx * p.Ny * 6),
-          event_rates_(p.Nx + p.Nx * p.Ny * 6, 0.0),
-          ftree_(p.Nx + p.Nx * p.Ny * 6),
-          idx_to_event_(p.Nx + p.Nx * p.Ny * 6)
+          max_events_(p.Nx + p.Nx * p.Ny * 7),
+          event_rates_(p.Nx + p.Nx * p.Ny * 7, 0.0),
+          ftree_(p.Nx + p.Nx * p.Ny * 7),
+          idx_to_event_(p.Nx + p.Nx * p.Ny * 7)
     {
         // Validate.
         if (p_.Nx < 1)
@@ -606,11 +611,12 @@ private:
             for (int x = 0; x < p_.Nx; ++x)
             {
                 int site_off = (y * p_.Nx + x) * 6;
-                for (int d = 0; d < 6; ++d)
-                {
+                for (int d = 0; d < 6; ++d) {
                     int idx = base + site_off + d;
+
                     const int *DX = (y & 1) ? ODD_DX : EVEN_DX;
                     const int *DY = (y & 1) ? ODD_DY : EVEN_DY;
+
                     idx_to_event_[idx] = {
                         false,
                         (int16_t)x,
@@ -618,6 +624,15 @@ private:
                         (int16_t)(x + DX[d]),
                         (int16_t)(y + DY[d])};
                 }
+
+                // passivation event
+                idx_to_event_[base + site_off + 6] = {
+                    false,
+                    (int16_t)x,
+                    (int16_t)y,
+                    0,
+                    0
+                };
             }
         }
     }
@@ -649,6 +664,30 @@ private:
 
         int x0 = ev.sx, y0 = ev.sy;
         int8_t atype = at(x0, y0);
+        // passivation event
+        if(ev.dx == 0 && ev.dy == 0)
+        {
+            if(atype != DEPOSITED)
+                return 0.0;
+            // Passivation only occurs on exposed deposited atoms
+            bool exposed = false;
+            int empty_neighbors = 0;
+            for_each_neighbour(x0, y0, [&](int nx, int ny)
+            {
+                if(at(nx,ny) == EMPTY) {
+                    exposed = true;
+                    empty_neighbors++;
+                }
+            });
+            if(!exposed)
+                return 0.0;
+            double barrier = p_.E_pass;
+            // More exposed surface atoms passivate faster
+            double surface_factor = 1.0 + 0.25 * empty_neighbors;
+            return p_.nu_p *
+                surface_factor *
+                std::exp(-barrier/(p_.kB*p_.T));
+        }
         if (atype != FREE && atype != DEPOSITED)
             return 0.0;
 
@@ -737,7 +776,7 @@ private:
             if (y == top_y)
                 update_rate_at(drop_index(x));
             int base = hop_base_index(x, y);
-            for (int d = 0; d < 6; ++d)
+            for (int d = 0; d < 7; ++d)
                 update_rate_at(base + d);
         }
     }
@@ -753,7 +792,9 @@ private:
         bool bonded = false;
         for_each_neighbour(x, y, [&](int nx, int ny)
                            {
-                if (at(nx, ny) == DEPOSITED || at(nx, ny) == SUBSTRATE)
+                if (at(nx, ny) == DEPOSITED ||
+                    at(nx, ny) == PASSIVATED ||
+                    at(nx, ny) == SUBSTRATE)
                     bonded = true; });
         return bonded ? DEPOSITED : FREE;
     }
@@ -841,11 +882,25 @@ public:
         {
             int x0 = ev.sx, y0 = ev.sy;
             int x1 = wrap_x(ev.dx), y1 = ev.dy;
-            int8_t atype = at(x0, y0);
-            at(x0, y0) = EMPTY;
-            at(x1, y1) = atype;
-            directly_changed.emplace_back(x0, y0);
-            directly_changed.emplace_back(x1, y1);
+            // passivation
+            if(ev.dx == 0 && ev.dy == 0)
+            {
+                if(at(x0,y0)==DEPOSITED)
+                {
+                    at(x0,y0)=PASSIVATED;
+                    directly_changed.emplace_back(x0,y0);
+                }
+            }
+            else
+            {
+                int x1 = wrap_x(ev.dx);
+                int y1 = ev.dy;
+                int8_t atype = at(x0, y0);
+                at(x0, y0) = EMPTY;
+                at(x1, y1) = atype;
+                directly_changed.emplace_back(x0, y0);
+                directly_changed.emplace_back(x1, y1);
+            }
         }
 
         auto relaxed = update_bonding_relaxation(directly_changed);
@@ -859,7 +914,18 @@ public:
         ++step_;
         return true;
     }
+    int passivated_count() const
+    {
+        int count = 0;
 
+        for (auto v : lattice_)
+        {
+            if (v == PASSIVATED)
+                count++;
+        }
+
+        return count;
+    }
     double fill_percentage() const
     {
         int deposited = 0;
@@ -890,7 +956,7 @@ private:
         {
             if (v == FREE)
                 ++nf;
-            else if (v == DEPOSITED)
+            else if (v == DEPOSITED || v == PASSIVATED)
                 ++nd;
         }
         return {nf, nd, nf + nd};
@@ -1104,6 +1170,8 @@ extern "C"
         double e1,
         double nu_f,
         double nu_d,
+        double nu_p,
+        double E_pass,
         int seed)
     {
         wasm_params.Nx = Nx;
@@ -1114,6 +1182,9 @@ extern "C"
         wasm_params.e1 = e1;
         wasm_params.nu_f = nu_f;
         wasm_params.nu_d = nu_d;
+        //enable passivation
+        wasm_params.nu_p = nu_p;
+        wasm_params.E_pass = E_pass;
         wasm_params.rng_seed = seed;
 
         wasm_params.pcg.seed((uint64_t)seed);
@@ -1161,20 +1232,19 @@ extern "C"
             if (!success)
                 break;
         }
-
-#ifdef __EMSCRIPTEN__
-        if (wasm_sim != nullptr)
-        {
-            if (wasm_sim->step() % 10000 == 0)
-            {
-                updateFrontend(wasm_sim->step());
-            }
-        }
-        else
-        {
-            printf("CRITICAL ERROR: wasm_sim became NULL right before updateFrontend!\n");
-        }
-#endif
+        #ifdef __EMSCRIPTEN__
+                if (wasm_sim != nullptr)
+                {
+                    if (wasm_sim->step() % 10000 == 0)
+                    {
+                        updateFrontend(wasm_sim->step());
+                    }
+                }
+                else
+                {
+                    printf("CRITICAL ERROR: wasm_sim became NULL right before updateFrontend!\n");
+                }
+        #endif
     }
 
     EMSCRIPTEN_KEEPALIVE
@@ -1217,7 +1287,11 @@ extern "C"
     {
         return wasm_sim ? wasm_sim->fill_percentage() : 0.0;
     }
-    
+    EMSCRIPTEN_KEEPALIVE
+    int get_passivated()
+    {
+        return wasm_sim ? wasm_sim->passivated_count() : 0;
+    }
     EMSCRIPTEN_KEEPALIVE
     int get_step()
     {
