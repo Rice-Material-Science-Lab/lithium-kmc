@@ -3,9 +3,21 @@
  *
  * WASM version of C++ port of LKMC_v2_commented_b.py.
  *
- * Build (emscripten sdk needed):
- * emcc lkmc-wasm.cpp -o public/lkmc-wasm.js -O3 -fexceptions -sEXPORT_ES6 -sMODULARIZE -sEXPORTED_FUNCTIONS="['_set_params', '_init_simulation', '_run_steps', '_get_lattice_data', '_get_width', '_get_height', '_get_step', '_get_time', '_cleanup_simulation']" -sEXPORTED_RUNTIME_METHODS="['ccall','cwrap', 'HEAP8', 'wasmMemory']"
+ *  * Build:
+ * emcc lkmc-wasm.cpp -o public/lkmc-wasm.js -O3 -fexceptions -sEXPORT_ES6 -sMODULARIZE -sEXPORTED_FUNCTIONS="['_set_params','_init_simulation','_run_steps','_get_lattice_data','_get_width','_get_height','_get_step','_get_time','_get_fill','_cleanup_simulation']" -sEXPORTED_RUNTIME_METHODS="['ccall','cwrap','HEAP8','wasmMemory']"
  *
+ * Exported WASM stuff:
+ *   _set_params(int Nx, int Ny, double d0, double T, double e0, double e1, double nu_f, double nu_d, int seed)
+ *   _init_simulation()
+ *   _run_steps(int steps)
+ *   _get_lattice_data()
+ *   _get_width()
+ *   _get_height()
+ *   _get_step()
+ *   _get_time()
+ *   _get_fill()
+ *   _cleanup_simulation()
+ * 
  * Then, you should be able to use this on the web
  *
  * Emscripten docs (if you're confused):
@@ -848,6 +860,21 @@ public:
         return true;
     }
 
+    double fill_percentage() const
+    {
+        int deposited = 0;
+
+        for (auto v : lattice_)
+        {
+            if (v == FREE || v == DEPOSITED)
+                deposited++;
+        }
+
+        int total_sites = p_.Nx * p_.Ny;
+
+        return 100.0 * deposited / total_sites;
+    }
+
 private:
     // -----------------------------------------------------------------------
     // Output helpers
@@ -867,21 +894,6 @@ private:
                 ++nd;
         }
         return {nf, nd, nf + nd};
-    }
-
-    double fill_percentage() const
-    {
-        int deposited = 0;
-
-        for (auto v : lattice_)
-        {
-            if (v == FREE || v == DEPOSITED)
-                deposited++;
-        }
-
-        int total_sites = p_.Nx * p_.Ny;
-
-        return 100.0 * deposited / total_sites;
     }
 
     void record_history(const std::string &label)
@@ -1188,6 +1200,24 @@ extern "C"
         return wasm_sim ? wasm_sim->height() : 0;
     }
 
+    EMSCRIPTEN_KEEPALIVE
+    const int8_t *get_lattice()
+    {
+        return wasm_sim ? wasm_sim->lattice_data() : nullptr;
+    }
+
+    EMSCRIPTEN_KEEPALIVE
+    int get_lattice_size()
+    {
+        return wasm_sim ? wasm_sim->width() * wasm_sim->height() : 0;
+    }
+
+    EMSCRIPTEN_KEEPALIVE
+    double get_fill()
+    {
+        return wasm_sim ? wasm_sim->fill_percentage() : 0.0;
+    }
+    
     EMSCRIPTEN_KEEPALIVE
     int get_step()
     {
