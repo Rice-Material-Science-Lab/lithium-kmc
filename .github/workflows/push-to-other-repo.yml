@@ -22,7 +22,7 @@ jobs:
       - name: Compile C++ to WASM
         run: |
           mkdir -p public
-          emcc lkmc-wasm.cpp -o public/lkmc-wasm.js -O3 -fexceptions -sEXPORT_ES6 -sMODULARIZE -sEXPORTED_FUNCTIONS="['_set_params', '_init_simulation', '_run_steps', '_get_lattice', '_get_width', '_get_height', '_get_step', '_get_time', '_cleanup_simulation']" -sEXPORTED_RUNTIME_METHODS="['ccall','cwrap', 'HEAP8', 'wasmMemory']"
+          emcc lkmc-wasm.cpp -o public/lkmc-wasm.js -O3 -fexceptions -sEXPORT_ES6 -sMODULARIZE -sEXPORTED_FUNCTIONS="['_set_params','_init_simulation','_run_steps','_get_lattice','_get_lattice_size','_get_width','_get_height','_get_step','_get_time','_get_fill','_cleanup_simulation']" -sEXPORTED_RUNTIME_METHODS="['ccall','cwrap', 'HEAP8', 'wasmMemory']"
 
       - name: Push Build Artifacts to Destination Repo
         if: github.ref == 'refs/heads/main'
