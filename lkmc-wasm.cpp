@@ -198,16 +198,16 @@ static constexpr int ODD_DY[6] = {
 
 struct KMCParams
 {
-    int Nx = 40;
-    int Ny = 25;
-    double T = 300.0;
-    double d0 = 1.0e3;
-    double e0 = -0.2;
-    double e1 = -0.5;
-    double nu_f = 5.0e9;
-    double nu_d = 1.0e9;
-    double nu_p = 1.0e6;          // passivation attempt frequency
-    double E_pass = 0.25;         // passivation activation barrier (eV)
+    int Nx = 100;
+    int Ny = 100;
+    double T = 350.0;
+    double d0 = 5e3;
+    double e0 = -0.08;
+    double e1 = -0.25;
+    double nu_f = 1e10;
+    double nu_d = 5e10;
+    double nu_p   = 1e9;
+    double E_pass = 0.15; // passivation activation barrier (eV)
     double kB = 8.617333262145e-5; // eV / K
     int max_steps = 400000;
     double max_time = 100.0;
@@ -661,7 +661,17 @@ private:
         if (ev.is_drop)
         {
             int x1 = ev.dx, y1 = ev.dy;
-            return (at(x1, y1) == EMPTY) ? p_.d0 : 0.0;
+            if(at(x1,y1)!=EMPTY)
+                return 0.0;
+
+            double neighbors = 0;
+
+            for_each_neighbour(x1,y1,[&](int nx,int ny){
+                if(at(nx,ny)==DEPOSITED)
+                    neighbors++;
+            });
+
+            return p_.d0*(1.0 + 2.0*neighbors);
         }
 
         int x0 = ev.sx, y0 = ev.sy;
@@ -669,7 +679,7 @@ private:
         // passivation event
         if(ev.dx == 0 && ev.dy == 0)
         {
-            if(atype != DEPOSITED)
+            if(atype != DEPOSITED && atype != FREE)
                 return 0.0;
             // Passivation only occurs on exposed deposited atoms
             bool exposed = false;
