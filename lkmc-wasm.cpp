@@ -4,7 +4,7 @@
  * WASM version of C++ port of LKMC_v2_commented_b.py.
  *
  *  * Build:
- * emcc lkmc-wasm.cpp -o public/lkmc-wasm.js -O3 -fexceptions -sEXPORT_ES6 -sMODULARIZE -sEXPORTED_FUNCTIONS="['_set_params','_init_simulation','_run_steps','_get_lattice_data','_get_lattice','_get_lattice_size','_get_width','_get_height','_get_step','_get_time','_get_fill','_get_passivated','_cleanup_simulation']" -sEXPORTED_RUNTIME_METHODS="['ccall','cwrap','HEAP8','wasmMemory']"
+ * emcc lkmc-wasm.cpp -o public/lkmc-wasm.js -O3 -fexceptions -sEXPORT_ES6 -sMODULARIZE -sEXPORTED_FUNCTIONS="['_set_params','_init_simulation','_run_steps','_get_lattice_data','_get_lattice','_get_lattice_size','_get_width','_get_height','_get_step','_get_time','_get_fill','_get_stats_json' ,'_get_passivated','_cleanup_simulation']" -sEXPORTED_RUNTIME_METHODS="['ccall','cwrap','HEAP8','wasmMemory']"
  * Exported WASM stuff:
  *   _set_params(int Nx, int Ny, double d0, double T, double e0, double e1, double nu_f, double nu_d, int seed)
  *   _init_simulation()
@@ -33,6 +33,8 @@
  *   e1          = -0.5
  *   nu_f        = 5e9
  *   nu_d        = 1e9
+ *   nu_p        = 1e6
+ *   E_pass      = 0.25
  *   max_steps   = 400000
  *   max_time    = 100.0
  *   rng_seed    = 394583
@@ -436,7 +438,7 @@ public:
           rng_(p.pcg),
           lattice_(p.Ny * p.Nx, EMPTY),
           num_drop_(p.Nx),
-          num_hop_(p.Nx * p.Ny * 6),
+          num_hop_(p.Nx * p.Ny * 7),
           max_events_(p.Nx + p.Nx * p.Ny * 7),
           event_rates_(p.Nx + p.Nx * p.Ny * 7, 0.0),
           ftree_(p.Nx + p.Nx * p.Ny * 7),
@@ -610,7 +612,7 @@ private:
         {
             for (int x = 0; x < p_.Nx; ++x)
             {
-                int site_off = (y * p_.Nx + x) * 6;
+                int site_off = (y * p_.Nx + x) * 7;
                 for (int d = 0; d < 6; ++d) {
                     int idx = base + site_off + d;
 
@@ -640,7 +642,7 @@ private:
     int drop_index(int x) const { return x; }
     int hop_base_index(int x, int y) const
     {
-        return num_drop_ + (y * p_.Nx + x) * 6;
+        return num_drop_ + (y * p_.Nx + x) * 7;
     }
 
     // -----------------------------------------------------------------------
@@ -925,6 +927,40 @@ public:
         }
 
         return count;
+    }
+    std::string get_stats_json() const {
+        int empty = 0;
+        int free = 0;
+        int deposited = 0;
+        int substrate = 0;
+        int passivated = 0;
+
+        for (auto v : lattice_)
+        {
+            switch(v)
+            {
+                case EMPTY:       empty++; break;
+                case FREE:        free++; break;
+                case DEPOSITED:   deposited++; break;
+                case SUBSTRATE:   substrate++; break;
+                case PASSIVATED:  passivated++; break;
+            }
+        }
+
+        std::ostringstream json;
+
+        json << "{"
+            << "\"empty\":" << empty << ","
+            << "\"free\":" << free << ","
+            << "\"deposited\":" << deposited << ","
+            << "\"passivated\":" << passivated << ","
+            << "\"substrate\":" << substrate << ","
+            << "\"step\":" << step_ << ","
+            << "\"time\":" << time_ << ","
+            << "\"fill\":" << fill_percentage()
+            << "}";
+
+        return json.str();
     }
     double fill_percentage() const
     {
@@ -1262,6 +1298,18 @@ extern "C"
     int get_width()
     {
         return wasm_sim ? wasm_sim->width() : 0;
+    }
+
+    EMSCRIPTEN_KEEPALIVE
+    const char* get_stats_json() {
+        static std::string json;
+
+        if (!wasm_sim)
+            return "{}";
+
+        json = wasm_sim->get_stats_json();
+
+        return json.c_str();
     }
 
     EMSCRIPTEN_KEEPALIVE
