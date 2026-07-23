@@ -1485,6 +1485,15 @@ extern "C"
     {
         wasm_sim.reset();
     }
+
+    EMSCRIPTEN_KEEPALIVE
+    void force_update_frontend()
+    {
+        if (wasm_sim)
+        {
+            updateFrontend(wasm_sim->step());
+        }
+    }
 }
 
 #endif
