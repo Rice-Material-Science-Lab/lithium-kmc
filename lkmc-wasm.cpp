@@ -76,7 +76,7 @@
 extern "C"
 {
     EM_JS(void, updateFrontend, (int step), {
-        if (typeof window.updateSimulation == = "function")
+        if (typeof window.updateSimulation === "function")
         {
             window.updateSimulation(step);
         }
