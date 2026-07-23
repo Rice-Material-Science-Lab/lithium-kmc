@@ -1281,7 +1281,7 @@ extern "C"
         #ifdef __EMSCRIPTEN__
                 if (wasm_sim != nullptr)
                 {
-                    if (wasm_sim->step() % 1000 == 0)
+                    if (wasm_sim->step() % 20000 == 0)
                     {
                         updateFrontend(wasm_sim->step());
                     }
