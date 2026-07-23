@@ -4,9 +4,9 @@
  * WASM version of C++ port of LKMC_v2_commented_b.py.
  *
  *  * Build:
- * emcc lkmc-wasm.cpp -o public/lkmc-wasm.js -O3 -fexceptions -sEXPORT_ES6 -sMODULARIZE -sEXPORTED_FUNCTIONS="['_set_params','_init_simulation','_run_steps','_get_lattice_data','_get_lattice','_get_lattice_size','_get_width','_get_height','_get_step','_get_time','_get_fill','_get_stats_json','_get_passivated','_cleanup_simulation','_force_update_frontend']" -sEXPORTED_RUNTIME_METHODS="['ccall','cwrap','HEAP8','wasmMemory']"
+ * emcc lkmc-wasm.cpp -o public/lkmc-wasm.js -O3 -fexceptions -sEXPORT_ES6 -sMODULARIZE -sEXPORTED_FUNCTIONS="['_set_params','_init_simulation','_run_steps','_get_lattice_data','_get_lattice','_get_lattice_size','_get_width','_get_height','_get_step','_get_time','_get_fill','_get_stats_json' ,'_get_passivated','_cleanup_simulation']" -sEXPORTED_RUNTIME_METHODS="['ccall','cwrap','HEAP8','wasmMemory']"
  * Exported WASM stuff:
- *   _set_params(int Nx, int Ny, double d0, double T, double e0, double e1, double nu_f, double nu_d, int seed)
+ *   _set_params(int Nx, int Ny, double d0, double T, double e0, double e1, double nu_f, double nu_d, double nu_p, double E_pass, int seed)
  *   _init_simulation()
  *   _run_steps(int steps)
  *   _get_lattice_data()
@@ -16,7 +16,7 @@
  *   _get_time()
  *   _get_fill()
  *   _cleanup_simulation()
- *
+ * 
  * Then, you should be able to use this on the web
  *
  * Emscripten docs (if you're confused):
@@ -62,6 +62,7 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <memory>
 #include <map>
 #include <optional>
 #include <queue>
@@ -104,26 +105,36 @@ namespace fs = std::filesystem;
 // ---------------------------------------------------------------------------
 struct PCG64State
 {
-    uint64_t state_hi = 0x50c3ed493ae78588ULL; // default: numpy seed=394583
-    uint64_t state_lo = 0x2c8bef01c72f99e5ULL;
-    uint64_t inc_hi = 0x71a5befeec2f5ccaULL;
-    uint64_t inc_lo = 0x4df2b37d5d7aa1cbULL;
+    uint64_t state_hi;
+    uint64_t state_lo;
+    uint64_t inc_hi;
+    uint64_t inc_lo;
 
-    // expand passed int into 256 bits needed
-    void seed(uint64_t s)
+    void seed(uint64_t seed)
     {
-        auto splitmix64 = [](uint64_t &state) -> uint64_t
-        {
-            uint64_t z = (state += 0x9e3779b97f4a7c15ULL);
-            z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
-            z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
-            return z ^ (z >> 31);
+        std::seed_seq seq{
+            (uint32_t)seed,
+            (uint32_t)(seed >> 32)
         };
 
-        state_hi = splitmix64(s);
-        state_lo = splitmix64(s);
-        inc_hi = splitmix64(s);
-        inc_lo = splitmix64(s) | 1ULL;
+        uint32_t data[8];
+        seq.generate(data, data + 8);
+
+        state_hi =
+            ((uint64_t)data[0] << 32) |
+            data[1];
+
+        state_lo =
+            ((uint64_t)data[2] << 32) |
+            data[3];
+
+        inc_hi =
+            ((uint64_t)data[4] << 32) |
+            data[5];
+
+        inc_lo =
+            (((uint64_t)data[6] << 32) |
+            data[7]) | 1ULL;
     }
 };
 
@@ -202,15 +213,18 @@ struct KMCParams
 {
     int Nx = 100;
     int Ny = 100;
-    double T = 350.0;
+    double T = 300.0;
     double d0 = 5e3;
     double e0 = -0.08;
     double e1 = -0.25;
-    double nu_f = 1e10;
-    double nu_d = 5e10;
-    double nu_p = 1e9;
-    double E_pass = 0.15;          // passivation activation barrier (eV)
+    double nu_f = 5e9;
+    double nu_d = 1e9;
+    double nu_p   = 1e3;
+    double E_pass = 0.3; // passivation activation barrier (eV)
     double kB = 8.617333262145e-5; // eV / K
+    double drop_probability = 0.8;
+    double hop_probability = 0.19;
+    double passivate_probability = 0.01;
     int max_steps = 400000;
     double max_time = 100.0;
     double stop_fill_fraction = -1.0;
@@ -407,11 +421,23 @@ private:
 // ---------------------------------------------------------------------------
 // Event descriptor (compact, avoids heap allocation per event)
 // ---------------------------------------------------------------------------
+enum EventType
+{
+    DROP_EVENT,
+    HOP_EVENT,
+    PASSIVATE_EVENT
+};
+
+
 struct Event
 {
-    bool is_drop;   // true => drop event; false => hop event
-    int16_t sx, sy; // source site  (valid only for hops)
-    int16_t dx, dy; // destination site raw (before x-wrap)
+    EventType type;
+
+    int16_t sx;
+    int16_t sy;
+
+    int16_t dx;
+    int16_t dy;
 };
 
 // ---------------------------------------------------------------------------
@@ -440,10 +466,12 @@ public:
           rng_(p.pcg),
           lattice_(p.Ny * p.Nx, EMPTY),
           num_drop_(p.Nx),
-          num_hop_(p.Nx * p.Ny * 7),
+          num_hop_(p.Nx * p.Ny * 6),
           max_events_(p.Nx + p.Nx * p.Ny * 7),
           event_rates_(p.Nx + p.Nx * p.Ny * 7, 0.0),
-          ftree_(p.Nx + p.Nx * p.Ny * 7),
+          drop_tree_(p.Nx),
+          hop_tree_(p.Nx * p.Ny * 6),
+          passivate_tree_(p.Nx * p.Ny),
           idx_to_event_(p.Nx + p.Nx * p.Ny * 7)
     {
         // Validate.
@@ -601,42 +629,67 @@ private:
     // -----------------------------------------------------------------------
     // Event indexing (mirrors Python _setup_indices, drop_index, hop_base_index)
     // -----------------------------------------------------------------------
-    void setup_indices()
-    {
+    void setup_indices() {
         int top_y = p_.Ny - 1;
-        // Drop events: indices [0, Nx)
-        for (int x = 0; x < p_.Nx; ++x)
+
+
+        for(int x=0;x<p_.Nx;x++)
         {
-            idx_to_event_[x] = {true, 0, 0, (int16_t)x, (int16_t)top_y};
-        }
-        int base = num_drop_;
-        for (int y = 0; y < p_.Ny; ++y)
-        {
-            for (int x = 0; x < p_.Nx; ++x)
+            idx_to_event_[x] =
             {
-                int site_off = (y * p_.Nx + x) * 7;
-                for (int d = 0; d < 6; ++d)
+                DROP_EVENT,
+                0,
+                0,
+                (int16_t)x,
+                (int16_t)top_y
+            };
+        }
+
+
+        int base=num_drop_;
+
+
+        for(int y=0;y<p_.Ny;y++)
+        {
+            for(int x=0;x<p_.Nx;x++)
+            {
+
+                int site =
+                    (y*p_.Nx+x)*7;
+
+
+                const int *DX =
+                    (y&1)?ODD_DX:EVEN_DX;
+
+                const int *DY =
+                    (y&1)?ODD_DY:EVEN_DY;
+
+
+
+                for(int d=0;d<6;d++)
                 {
-                    int idx = base + site_off + d;
 
-                    const int *DX = (y & 1) ? ODD_DX : EVEN_DX;
-                    const int *DY = (y & 1) ? ODD_DY : EVEN_DY;
-
-                    idx_to_event_[idx] = {
-                        false,
+                    idx_to_event_[base+site+d]=
+                    {
+                        HOP_EVENT,
                         (int16_t)x,
                         (int16_t)y,
-                        (int16_t)(x + DX[d]),
-                        (int16_t)(y + DY[d])};
+                        (int16_t)(x+DX[d]),
+                        (int16_t)(y+DY[d])
+                    };
                 }
 
-                // passivation event
-                idx_to_event_[base + site_off + 6] = {
-                    false,
+
+
+                idx_to_event_[base+site+6]=
+                {
+                    PASSIVATE_EVENT,
                     (int16_t)x,
                     (int16_t)y,
                     0,
-                    0};
+                    0
+                };
+
             }
         }
     }
@@ -660,46 +713,53 @@ private:
 
     double get_event_rate(const Event &ev) const
     {
-        if (ev.is_drop)
+        if(ev.type==DROP_EVENT)
         {
             int x1 = ev.dx, y1 = ev.dy;
-            if (at(x1, y1) != EMPTY)
+            if(at(x1,y1)!=EMPTY)
                 return 0.0;
 
             double neighbors = 0;
 
-            for_each_neighbour(x1, y1, [&](int nx, int ny)
-                               {
+            for_each_neighbour(x1,y1,[&](int nx,int ny){
                 if(at(nx,ny)==DEPOSITED)
-                    neighbors++; });
+                    neighbors++;
+            });
 
-            return p_.d0 * (1.0 + 2.0 * neighbors);
+            double E =
+                neighbors*p_.e0;
+
+            return p_.d0 *
+                std::exp(
+                    -E/(p_.kB*p_.T)
+                );
         }
 
         int x0 = ev.sx, y0 = ev.sy;
         int8_t atype = at(x0, y0);
         // passivation event
-        if (ev.dx == 0 && ev.dy == 0)
+        if(ev.type==PASSIVATE_EVENT)
         {
-            if (atype != DEPOSITED && atype != FREE)
+            if(atype != DEPOSITED && atype != FREE)
                 return 0.0;
             // Passivation only occurs on exposed deposited atoms
             bool exposed = false;
             int empty_neighbors = 0;
             for_each_neighbour(x0, y0, [&](int nx, int ny)
-                               {
+            {
                 if(at(nx,ny) == EMPTY) {
                     exposed = true;
                     empty_neighbors++;
-                } });
-            if (!exposed)
+                }
+            });
+            if(!exposed)
                 return 0.0;
             double barrier = p_.E_pass;
             // More exposed surface atoms passivate faster
             double surface_factor = 1.0 + 0.25 * empty_neighbors;
             return p_.nu_p *
-                   surface_factor *
-                   std::exp(-barrier / (p_.kB * p_.T));
+                surface_factor *
+                std::exp(-barrier/(p_.kB*p_.T));
         }
         if (atype != FREE && atype != DEPOSITED)
             return 0.0;
@@ -726,18 +786,35 @@ private:
     {
         double new_rate = get_event_rate(idx_to_event_[idx]);
         double delta = new_rate - event_rates_[idx];
-        if (std::abs(delta) > 1.0e-18)
+        if(std::abs(delta) > 1.0e-18)
         {
             event_rates_[idx] = new_rate;
-            ftree_.update(idx, delta);
+            EventType type = idx_to_event_[idx].type;
+            if(type == DROP_EVENT)
+            {
+                drop_tree_.update(idx, delta);
+            }
+            else if(type == HOP_EVENT)
+            {
+                hop_tree_.update(idx - num_drop_, delta);
+            }
+            else if(type == PASSIVATE_EVENT)
+            {
+                passivate_tree_.update(
+                    idx - num_drop_ - num_hop_,
+                    delta
+                );
+            }
         }
     }
 
-    void rebuild_all_rates()
+   void rebuild_all_rates()
     {
         std::fill(event_rates_.begin(), event_rates_.end(), 0.0);
-        ftree_.reset(max_events_);
-        for (int i = 0; i < max_events_; ++i)
+        drop_tree_.reset(num_drop_);
+        hop_tree_.reset(num_hop_);
+        passivate_tree_.reset(p_.Nx * p_.Ny);
+        for(int i = 0; i < max_events_; ++i)
             update_rate_at(i);
     }
 
@@ -869,23 +946,54 @@ public:
     // -----------------------------------------------------------------------
     bool execute_step()
     {
-        double r_tot = ftree_.total();
-        if (r_tot <= 0.0)
+        double total_drop = drop_tree_.total();
+        double total_hop = hop_tree_.total();
+        double total_pass = passivate_tree_.total();
+
+        double r_tot =
+            total_drop +
+            total_hop +
+            total_pass;
+
+        if(r_tot <= 0.0)
             return false;
 
         // Time increment.
         double u1 = std::max(rng_.next_double(), 1.0e-15);
         double dt = -std::log(u1) / r_tot;
 
-        // Select event.
-        double u2 = std::max(rng_.next_double(), 1.0e-15);
-        double target = u2 * r_tot;
-        int idx = ftree_.find_prefix_index(target);
+        int idx = -1;
+        double r = rng_.next_double() *
+                (total_drop + total_hop + total_pass);
+        if(r < total_drop)
+        {
+            double target = rng_.next_double() * total_drop;
+            idx = drop_tree_.find_prefix_index(target);
+        }
+        else if(r < total_drop + total_hop)
+        {
+            double target =
+                rng_.next_double() * total_hop;
+            idx =
+                num_drop_ +
+                hop_tree_.find_prefix_index(target);
+        }
+        else
+        {
+            double target =
+                rng_.next_double() * total_pass;
+            idx =
+                num_drop_ +
+                num_hop_ +
+                passivate_tree_.find_prefix_index(target);
+        }
+        if(idx < 0)
+            return false;
 
         const Event &ev = idx_to_event_[idx];
         std::vector<std::pair<int, int>> directly_changed;
 
-        if (ev.is_drop)
+        if(ev.type==DROP_EVENT)
         {
             int x1 = ev.dx, y1 = ev.dy;
             at(x1, y1) = FREE;
@@ -896,27 +1004,30 @@ public:
             int x0 = ev.sx, y0 = ev.sy;
             int x1 = wrap_x(ev.dx), y1 = ev.dy;
             // passivation
-            if (ev.dx == 0 && ev.dy == 0)
+            if(ev.type==PASSIVATE_EVENT)
             {
-                if (at(x0, y0) == DEPOSITED)
+                if(at(x0,y0)==DEPOSITED || at(x0,y0)==FREE)
                 {
-                    at(x0, y0) = PASSIVATED;
-                    directly_changed.emplace_back(x0, y0);
+                    at(x0,y0)=PASSIVATED;
+                    directly_changed.emplace_back(x0,y0);
                 }
             }
             else
             {
                 int x1 = wrap_x(ev.dx);
                 int y1 = ev.dy;
-                int8_t atype = at(x0, y0);
-                at(x0, y0) = EMPTY;
-                at(x1, y1) = atype;
+                if(at(x0,y0)!=FREE)
+                    return false;
+                int8_t atom=FREE;
+                at(x0,y0)=EMPTY;
+                at(x1,y1)=atom;
                 directly_changed.emplace_back(x0, y0);
                 directly_changed.emplace_back(x1, y1);
             }
         }
 
-        auto relaxed = update_bonding_relaxation(directly_changed);
+        std::vector<std::pair<int,int>> relaxed =
+            update_bonding_relaxation(directly_changed);
 
         // Merge changed sets.
         std::vector<std::pair<int, int>> all_changed = directly_changed;
@@ -939,8 +1050,7 @@ public:
 
         return count;
     }
-    std::string get_stats_json() const
-    {
+    std::string get_stats_json() const {
         int empty = 0;
         int free = 0;
         int deposited = 0;
@@ -949,38 +1059,28 @@ public:
 
         for (auto v : lattice_)
         {
-            switch (v)
+            switch(v)
             {
-            case EMPTY:
-                empty++;
-                break;
-            case FREE:
-                free++;
-                break;
-            case DEPOSITED:
-                deposited++;
-                break;
-            case SUBSTRATE:
-                substrate++;
-                break;
-            case PASSIVATED:
-                passivated++;
-                break;
+                case EMPTY:       empty++; break;
+                case FREE:        free++; break;
+                case DEPOSITED:   deposited++; break;
+                case SUBSTRATE:   substrate++; break;
+                case PASSIVATED:  passivated++; break;
             }
         }
 
         std::ostringstream json;
 
         json << "{"
-             << "\"empty\":" << empty << ","
-             << "\"free\":" << free << ","
-             << "\"deposited\":" << deposited << ","
-             << "\"passivated\":" << passivated << ","
-             << "\"substrate\":" << substrate << ","
-             << "\"step\":" << step_ << ","
-             << "\"time\":" << time_ << ","
-             << "\"fill\":" << fill_percentage()
-             << "}";
+            << "\"empty\":" << empty << ","
+            << "\"free\":" << free << ","
+            << "\"deposited\":" << deposited << ","
+            << "\"passivated\":" << passivated << ","
+            << "\"substrate\":" << substrate << ","
+            << "\"step\":" << step_ << ","
+            << "\"time\":" << time_ << ","
+            << "\"fill\":" << fill_percentage()
+            << "}";
 
         return json.str();
     }
@@ -990,7 +1090,7 @@ public:
 
         for (auto v : lattice_)
         {
-            if (v == FREE || v == DEPOSITED)
+            if(v==DEPOSITED || v==PASSIVATED)
                 deposited++;
         }
 
@@ -1111,11 +1211,12 @@ private:
         {
             uint8_t r, g, b;
         };
-        static const RGB PAL[4] = {
+        static const RGB PAL[5] = {
             {0x11, 0x11, 0x11}, // EMPTY
             {0x55, 0x99, 0xdd}, // FREE      (steel blue)
             {0xdd, 0x88, 0x33}, // DEPOSITED (amber)
             {0x22, 0x22, 0x22}, // SUBSTRATE (dark grey)
+            {0x99,0x99,0x99},   // PASSIVATED
         };
 
         // Write rows top-to-bottom (lattice row 0 = substrate = bottom of image).
@@ -1199,7 +1300,9 @@ private:
     int max_events_;
 
     std::vector<double> event_rates_;
-    FenwickTree ftree_;
+    FenwickTree drop_tree_;
+    FenwickTree hop_tree_;
+    FenwickTree passivate_tree_;
     std::vector<Event> idx_to_event_;
 
     double time_ = 0.0;
@@ -1215,7 +1318,7 @@ private:
 extern "C"
 {
 
-    static ElectrodepositionKMC *wasm_sim = nullptr;
+    static std::unique_ptr<ElectrodepositionKMC> wasm_sim;
     static KMCParams wasm_params = KMCParams{};
 
     EMSCRIPTEN_KEEPALIVE
@@ -1240,7 +1343,7 @@ extern "C"
         wasm_params.e1 = e1;
         wasm_params.nu_f = nu_f;
         wasm_params.nu_d = nu_d;
-        // enable passivation
+        //enable passivation
         wasm_params.nu_p = nu_p;
         wasm_params.E_pass = E_pass;
         wasm_params.rng_seed = seed;
@@ -1254,11 +1357,10 @@ extern "C"
 
         if (wasm_sim != nullptr)
         {
-            delete wasm_sim;
-            wasm_sim = nullptr;
+            wasm_sim.reset();
         }
 
-        wasm_sim = new ElectrodepositionKMC(wasm_params);
+        wasm_sim = std::make_unique<ElectrodepositionKMC>(wasm_params);
     }
 
     EMSCRIPTEN_KEEPALIVE
@@ -1323,8 +1425,7 @@ extern "C"
     }
 
     EMSCRIPTEN_KEEPALIVE
-    const char *get_stats_json()
-    {
+    const char* get_stats_json() {
         static std::string json;
 
         if (!wasm_sim)
@@ -1382,8 +1483,7 @@ extern "C"
     EMSCRIPTEN_KEEPALIVE
     void cleanup_simulation()
     {
-        delete wasm_sim;
-        wasm_sim = nullptr;
+        wasm_sim.reset();
     }
 
     EMSCRIPTEN_KEEPALIVE
