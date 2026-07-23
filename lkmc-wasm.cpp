@@ -440,6 +440,21 @@ struct Event
     int16_t dy;
 };
 
+// for stats stuff
+
+struct StatsRow
+{
+    int step;
+    double time;
+    int empty;
+    int free;
+    int deposited;
+    int passivated;
+    int substrate;
+    double fill;
+    double total_rate;
+};
+
 // ---------------------------------------------------------------------------
 // History record
 // ---------------------------------------------------------------------------
@@ -513,6 +528,7 @@ public:
 
         // Record initial state.
         record_history("initial");
+        record_stats();
 #ifndef __EMSCRIPTEN__
         if (p_.save_snapshots)
             save_snapshot("initial");
@@ -1036,6 +1052,10 @@ public:
 
         time_ += dt;
         ++step_;
+        if(step_ % 10000 == 0)
+        {
+            record_stats();
+        }
         return true;
     }
     int passivated_count() const
@@ -1050,37 +1070,33 @@ public:
 
         return count;
     }
-    std::string get_stats_json() const {
-        int empty = 0;
-        int free = 0;
-        int deposited = 0;
-        int substrate = 0;
-        int passivated = 0;
-
-        for (auto v : lattice_)
-        {
-            switch(v)
-            {
-                case EMPTY:       empty++; break;
-                case FREE:        free++; break;
-                case DEPOSITED:   deposited++; break;
-                case SUBSTRATE:   substrate++; break;
-                case PASSIVATED:  passivated++; break;
-            }
-        }
-
+    std::string get_stats_json() const
+    {
         std::ostringstream json;
 
-        json << "{"
-            << "\"empty\":" << empty << ","
-            << "\"free\":" << free << ","
-            << "\"deposited\":" << deposited << ","
-            << "\"passivated\":" << passivated << ","
-            << "\"substrate\":" << substrate << ","
-            << "\"step\":" << step_ << ","
-            << "\"time\":" << time_ << ","
-            << "\"fill\":" << fill_percentage()
-            << "}";
+        json << "[";
+
+        for(size_t i = 0; i < stats_history_.size(); i++)
+        {
+            const auto &s = stats_history_[i];
+
+            json << "{"
+                << "\"step\":" << s.step << ","
+                << "\"time\":" << s.time << ","
+                << "\"empty\":" << s.empty << ","
+                << "\"free\":" << s.free << ","
+                << "\"deposited\":" << s.deposited << ","
+                << "\"passivated\":" << s.passivated << ","
+                << "\"substrate\":" << s.substrate << ","
+                << "\"fill\":" << s.fill << ","
+                << "\"total_rate\":" << s.total_rate
+                << "}";
+
+            if(i + 1 < stats_history_.size())
+                json << ",";
+        }
+
+        json << "]";
 
         return json.str();
     }
@@ -1107,6 +1123,59 @@ private:
     {
         int free, dep, total;
     };
+
+    void record_stats()
+    {
+        int empty = 0;
+        int free = 0;
+        int deposited = 0;
+        int passivated = 0;
+        int substrate = 0;
+
+        for(auto v : lattice_)
+        {
+            switch(v)
+            {
+                case EMPTY:
+                    empty++;
+                    break;
+
+                case FREE:
+                    free++;
+                    break;
+
+                case DEPOSITED:
+                    deposited++;
+                    break;
+
+                case PASSIVATED:
+                    passivated++;
+                    break;
+
+                case SUBSTRATE:
+                    substrate++;
+                    break;
+            }
+        }
+
+        double total_rate = 0.0;
+
+        for(auto r : event_rates_)
+            total_rate += r;
+
+        stats_history_.push_back({
+            step_,
+            time_,
+            empty,
+            free,
+            deposited,
+            passivated,
+            substrate,
+            fill_percentage(),
+            total_rate
+        });
+    }
+
     Counts counts() const
     {
         int nf = 0, nd = 0;
@@ -1311,6 +1380,8 @@ private:
     fs::path out_dir_;
 #endif
     std::vector<HistoryRow> history_;
+    // Stores chart data every 10k steps
+    std::vector<StatsRow> stats_history_;
 };
 
 #ifdef __EMSCRIPTEN__
