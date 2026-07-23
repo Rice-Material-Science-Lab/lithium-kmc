@@ -4,7 +4,7 @@
  * WASM version of C++ port of LKMC_v2_commented_b.py.
  *
  *  * Build:
- * emcc lkmc-wasm.cpp -o public/lkmc-wasm.js -O3 -fexceptions -sEXPORT_ES6 -sMODULARIZE -sEXPORTED_FUNCTIONS="['_set_params','_init_simulation','_run_steps','_get_lattice_data','_get_lattice','_get_lattice_size','_get_width','_get_height','_get_step','_get_time','_get_fill','_get_stats_json' ,'_get_passivated','_cleanup_simulation']" -sEXPORTED_RUNTIME_METHODS="['ccall','cwrap','HEAP8','wasmMemory']"
+ * emcc lkmc-wasm.cpp -o public/lkmc-wasm.js -O3 -fexceptions -sEXPORT_ES6 -sMODULARIZE -sEXPORTED_FUNCTIONS="['_set_params','_init_simulation','_run_steps','_get_lattice_data','_get_lattice','_get_lattice_size','_get_width','_get_height','_get_step','_get_time','_get_fill','_get_stats_json','_get_passivated','_cleanup_simulation','_force_update_frontend']" -sEXPORTED_RUNTIME_METHODS="['ccall','cwrap','HEAP8','wasmMemory']"
  * Exported WASM stuff:
  *   _set_params(int Nx, int Ny, double d0, double T, double e0, double e1, double nu_f, double nu_d, int seed)
  *   _init_simulation()
@@ -16,7 +16,7 @@
  *   _get_time()
  *   _get_fill()
  *   _cleanup_simulation()
- * 
+ *
  * Then, you should be able to use this on the web
  *
  * Emscripten docs (if you're confused):
@@ -110,18 +110,20 @@ struct PCG64State
     uint64_t inc_lo = 0x4df2b37d5d7aa1cbULL;
 
     // expand passed int into 256 bits needed
-    void seed(uint64_t s) {
-        auto splitmix64 = [](uint64_t& state) -> uint64_t {
+    void seed(uint64_t s)
+    {
+        auto splitmix64 = [](uint64_t &state) -> uint64_t
+        {
             uint64_t z = (state += 0x9e3779b97f4a7c15ULL);
             z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
             z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
             return z ^ (z >> 31);
         };
-        
+
         state_hi = splitmix64(s);
         state_lo = splitmix64(s);
-        inc_hi   = splitmix64(s);
-        inc_lo   = splitmix64(s) | 1ULL;
+        inc_hi = splitmix64(s);
+        inc_lo = splitmix64(s) | 1ULL;
     }
 };
 
@@ -206,8 +208,8 @@ struct KMCParams
     double e1 = -0.25;
     double nu_f = 1e10;
     double nu_d = 5e10;
-    double nu_p   = 1e9;
-    double E_pass = 0.15; // passivation activation barrier (eV)
+    double nu_p = 1e9;
+    double E_pass = 0.15;          // passivation activation barrier (eV)
     double kB = 8.617333262145e-5; // eV / K
     int max_steps = 400000;
     double max_time = 100.0;
@@ -613,7 +615,8 @@ private:
             for (int x = 0; x < p_.Nx; ++x)
             {
                 int site_off = (y * p_.Nx + x) * 7;
-                for (int d = 0; d < 6; ++d) {
+                for (int d = 0; d < 6; ++d)
+                {
                     int idx = base + site_off + d;
 
                     const int *DX = (y & 1) ? ODD_DX : EVEN_DX;
@@ -633,8 +636,7 @@ private:
                     (int16_t)x,
                     (int16_t)y,
                     0,
-                    0
-                };
+                    0};
             }
         }
     }
@@ -661,44 +663,43 @@ private:
         if (ev.is_drop)
         {
             int x1 = ev.dx, y1 = ev.dy;
-            if(at(x1,y1)!=EMPTY)
+            if (at(x1, y1) != EMPTY)
                 return 0.0;
 
             double neighbors = 0;
 
-            for_each_neighbour(x1,y1,[&](int nx,int ny){
+            for_each_neighbour(x1, y1, [&](int nx, int ny)
+                               {
                 if(at(nx,ny)==DEPOSITED)
-                    neighbors++;
-            });
+                    neighbors++; });
 
-            return p_.d0*(1.0 + 2.0*neighbors);
+            return p_.d0 * (1.0 + 2.0 * neighbors);
         }
 
         int x0 = ev.sx, y0 = ev.sy;
         int8_t atype = at(x0, y0);
         // passivation event
-        if(ev.dx == 0 && ev.dy == 0)
+        if (ev.dx == 0 && ev.dy == 0)
         {
-            if(atype != DEPOSITED && atype != FREE)
+            if (atype != DEPOSITED && atype != FREE)
                 return 0.0;
             // Passivation only occurs on exposed deposited atoms
             bool exposed = false;
             int empty_neighbors = 0;
             for_each_neighbour(x0, y0, [&](int nx, int ny)
-            {
+                               {
                 if(at(nx,ny) == EMPTY) {
                     exposed = true;
                     empty_neighbors++;
-                }
-            });
-            if(!exposed)
+                } });
+            if (!exposed)
                 return 0.0;
             double barrier = p_.E_pass;
             // More exposed surface atoms passivate faster
             double surface_factor = 1.0 + 0.25 * empty_neighbors;
             return p_.nu_p *
-                surface_factor *
-                std::exp(-barrier/(p_.kB*p_.T));
+                   surface_factor *
+                   std::exp(-barrier / (p_.kB * p_.T));
         }
         if (atype != FREE && atype != DEPOSITED)
             return 0.0;
@@ -895,12 +896,12 @@ public:
             int x0 = ev.sx, y0 = ev.sy;
             int x1 = wrap_x(ev.dx), y1 = ev.dy;
             // passivation
-            if(ev.dx == 0 && ev.dy == 0)
+            if (ev.dx == 0 && ev.dy == 0)
             {
-                if(at(x0,y0)==DEPOSITED)
+                if (at(x0, y0) == DEPOSITED)
                 {
-                    at(x0,y0)=PASSIVATED;
-                    directly_changed.emplace_back(x0,y0);
+                    at(x0, y0) = PASSIVATED;
+                    directly_changed.emplace_back(x0, y0);
                 }
             }
             else
@@ -938,7 +939,8 @@ public:
 
         return count;
     }
-    std::string get_stats_json() const {
+    std::string get_stats_json() const
+    {
         int empty = 0;
         int free = 0;
         int deposited = 0;
@@ -947,28 +949,38 @@ public:
 
         for (auto v : lattice_)
         {
-            switch(v)
+            switch (v)
             {
-                case EMPTY:       empty++; break;
-                case FREE:        free++; break;
-                case DEPOSITED:   deposited++; break;
-                case SUBSTRATE:   substrate++; break;
-                case PASSIVATED:  passivated++; break;
+            case EMPTY:
+                empty++;
+                break;
+            case FREE:
+                free++;
+                break;
+            case DEPOSITED:
+                deposited++;
+                break;
+            case SUBSTRATE:
+                substrate++;
+                break;
+            case PASSIVATED:
+                passivated++;
+                break;
             }
         }
 
         std::ostringstream json;
 
         json << "{"
-            << "\"empty\":" << empty << ","
-            << "\"free\":" << free << ","
-            << "\"deposited\":" << deposited << ","
-            << "\"passivated\":" << passivated << ","
-            << "\"substrate\":" << substrate << ","
-            << "\"step\":" << step_ << ","
-            << "\"time\":" << time_ << ","
-            << "\"fill\":" << fill_percentage()
-            << "}";
+             << "\"empty\":" << empty << ","
+             << "\"free\":" << free << ","
+             << "\"deposited\":" << deposited << ","
+             << "\"passivated\":" << passivated << ","
+             << "\"substrate\":" << substrate << ","
+             << "\"step\":" << step_ << ","
+             << "\"time\":" << time_ << ","
+             << "\"fill\":" << fill_percentage()
+             << "}";
 
         return json.str();
     }
@@ -1228,7 +1240,7 @@ extern "C"
         wasm_params.e1 = e1;
         wasm_params.nu_f = nu_f;
         wasm_params.nu_d = nu_d;
-        //enable passivation
+        // enable passivation
         wasm_params.nu_p = nu_p;
         wasm_params.E_pass = E_pass;
         wasm_params.rng_seed = seed;
@@ -1278,19 +1290,19 @@ extern "C"
             if (!success)
                 break;
         }
-        #ifdef __EMSCRIPTEN__
-                if (wasm_sim != nullptr)
-                {
-                    if (wasm_sim->step() % 10000 == 0)
-                    {
-                        updateFrontend(wasm_sim->step());
-                    }
-                }
-                else
-                {
-                    printf("CRITICAL ERROR: wasm_sim became NULL right before updateFrontend!\n");
-                }
-        #endif
+#ifdef __EMSCRIPTEN__
+        if (wasm_sim != nullptr)
+        {
+            if (wasm_sim->step() % 20000 == 0)
+            {
+                updateFrontend(wasm_sim->step());
+            }
+        }
+        else
+        {
+            printf("CRITICAL ERROR: wasm_sim became NULL right before updateFrontend!\n");
+        }
+#endif
     }
 
     EMSCRIPTEN_KEEPALIVE
@@ -1311,7 +1323,8 @@ extern "C"
     }
 
     EMSCRIPTEN_KEEPALIVE
-    const char* get_stats_json() {
+    const char *get_stats_json()
+    {
         static std::string json;
 
         if (!wasm_sim)
@@ -1371,6 +1384,15 @@ extern "C"
     {
         delete wasm_sim;
         wasm_sim = nullptr;
+    }
+
+    EMSCRIPTEN_KEEPALIVE
+    void force_update_frontend()
+    {
+        if (wasm_sim)
+        {
+            updateFrontend(wasm_sim->step());
+        }
     }
 }
 
