@@ -1392,19 +1392,19 @@ extern "C"
             if (!success)
                 break;
         }
-        #ifdef __EMSCRIPTEN__
-                if (wasm_sim != nullptr)
-                {
-                    if (wasm_sim->step() % 100 == 0)
-                    {
-                        updateFrontend(wasm_sim->step());
-                    }
-                }
-                else
-                {
-                    printf("CRITICAL ERROR: wasm_sim became NULL right before updateFrontend!\n");
-                }
-        #endif
+#ifdef __EMSCRIPTEN__
+        if (wasm_sim != nullptr)
+        {
+            if (wasm_sim->step() % 10000 == 0)
+            {
+                updateFrontend(wasm_sim->step());
+            }
+        }
+        else
+        {
+            printf("CRITICAL ERROR: wasm_sim became NULL right before updateFrontend!\n");
+        }
+#endif
     }
 
     EMSCRIPTEN_KEEPALIVE
