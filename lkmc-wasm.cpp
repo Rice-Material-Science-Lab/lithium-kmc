@@ -202,6 +202,7 @@ struct KMCParams
 {
     int Nx = 100;
     int Ny = 100;
+    int material = 0;
     double T = 350.0;
     double d0 = 5e3;
     double e0 = -0.08;
@@ -442,7 +443,64 @@ struct HistoryRow
     int n_total;
     double total_rate;
 };
+struct MaterialProperties
+{
+    double e0;
+    double e1;
+    double nu_f;
+    double nu_d;
+    double E_pass;
+};
 
+// None of the params are set for sure rn
+MaterialProperties get_material(int id)
+{
+    switch(id)
+    {
+        // Copper
+        case 0:
+            return {
+                -0.08,   // atom-atom bonding
+                -0.25,   // substrate bonding
+                1e10,    // deposition
+                5e10,    // diffusion
+                0.15     // passivation
+            };
+
+        // Silver
+        case 1:
+            return {
+                -0.05,
+                -0.20,
+                8e9,
+                3e10,
+                0.10
+            };
+
+        // Gold
+        case 2:
+            return {
+                -0.12,
+                -0.30,
+                5e9,
+                1e10,
+                0.20
+            };
+
+        // Nickel
+        case 3:
+            return {
+                -0.15,
+                -0.35,
+                2e10,
+                8e10,
+                0.25
+            };
+
+        default:
+            return get_material(0);
+    }
+}
 // ---------------------------------------------------------------------------
 // Main simulator class (mirrors ElectrodepositionKMC)
 // ---------------------------------------------------------------------------
@@ -461,6 +519,13 @@ public:
           ftree_(p.Nx + p.Nx * p.Ny * 7),
           idx_to_event_(p.Nx + p.Nx * p.Ny * 7)
     {
+        auto mat = get_material(p_.material);
+
+        p_.e0 = mat.e0;
+        p_.e1 = mat.e1;
+        p_.nu_f = mat.nu_f;
+        p_.nu_d = mat.nu_d;
+        p_.E_pass = mat.E_pass;
         // Validate.
         if (p_.Nx < 1)
             throw std::invalid_argument("Nx must be >= 1.");
@@ -1290,6 +1355,7 @@ extern "C"
         double nu_d,
         double nu_p,
         double E_pass,
+        int material,
         int seed)
     {
         wasm_params.Nx = Nx;
@@ -1303,6 +1369,7 @@ extern "C"
         // enable passivation
         wasm_params.nu_p = nu_p;
         wasm_params.E_pass = E_pass;
+        wasm_params.material = material;
         wasm_params.rng_seed = seed;
 
         wasm_params.pcg.seed((uint64_t)seed);
