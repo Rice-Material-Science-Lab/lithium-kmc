@@ -202,7 +202,7 @@ struct KMCParams
 {
     int Nx = 100;
     int Ny = 100;
-    int material = 0;
+    int material = 4; // Default material: 4 (Lithium)
     double T = 350.0;
     double d0 = 5e3;
     double e0 = -0.08;
@@ -295,6 +295,8 @@ KMCParams load_config(const std::string &path, KMCParams p = {})
             p.Nx = toInt(val, p.Nx);
         else if (key == "Ny")
             p.Ny = toInt(val, p.Ny);
+        else if (key == "material")
+            p.material = toInt(val, p.material);
         else if (key == "T")
             p.T = toDouble(val, p.T);
         else if (key == "d0")
@@ -457,6 +459,16 @@ MaterialProperties get_material(int id)
 {
     switch(id)
     {
+        // Lithium (Li) - Default Material
+        case 4:
+            return {
+                -0.20,   // atom-atom bonding (eV)
+                -0.50,   // substrate bonding (eV)
+                5e9,     // fast hopping / surface diffusion rate (s^-1)
+                1e9,     // detachment rate (s^-1)
+                0.25     // passivation activation barrier (eV)
+            };
+
         // Copper
         case 0:
             return {
@@ -498,7 +510,7 @@ MaterialProperties get_material(int id)
             };
 
         default:
-            return get_material(0);
+            return get_material(4);
     }
 }
 // ---------------------------------------------------------------------------
