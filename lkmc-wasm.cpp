@@ -202,7 +202,7 @@ struct KMCParams
 {
     int Nx = 100;
     int Ny = 100;
-    int material = 4; // Default material: 4 (Lithium)
+    int material = 3; // Default material: 3 (Lithium)
     double T = 300.0;
     double d0 = 1000.0;
     double e0 = -0.28;
@@ -452,6 +452,16 @@ struct MaterialProperties
     double nu_f;
     double nu_d;
     double E_pass;
+    // Additional material properties (not currently used in the simulation)
+    double surface_energy;        // J/m²
+    double activation_diffusion;  // eV
+    double activation_attach;     // eV
+    double activation_detach;     // eV
+    double lattice_constant;      // nm
+    double atomic_volume;         // m³
+    double exchange_current;      // A/m²
+    double transfer_coeff;        // Butler-Volmer α
+    int crystal_type;             // FCC/BCC/HCP
 };
 
 // None of the params are set for sure rn
@@ -460,7 +470,7 @@ MaterialProperties get_material(int id)
     switch(id)
     {
         // Lithium (Li) - Default Material with exact UI default parameters
-        case 4:
+        case 3:
             return {
                 -0.28,   // atom-atom bonding (eV)
                 -0.50,   // substrate bonding (eV)
@@ -489,18 +499,8 @@ MaterialProperties get_material(int id)
                 0.10
             };
 
-        // Gold
-        case 2:
-            return {
-                -0.12,
-                -0.30,
-                5e9,
-                1e10,
-                0.20
-            };
-
         // Nickel
-        case 3:
+        case 2:
             return {
                 -0.15,
                 -0.35,
@@ -510,7 +510,7 @@ MaterialProperties get_material(int id)
             };
 
         default:
-            return get_material(4);
+            return get_material(3);
     }
 }
 // ---------------------------------------------------------------------------
@@ -746,9 +746,44 @@ private:
     double calc_local_energy(int x, int y, int8_t atom_type) const
     {
         double e = 0.0;
+
+        int coord = 0;
+
         for_each_neighbour(x, y, [&](int nx, int ny)
-                           { e += energy_lookup_[atom_type][(uint8_t)at(nx, ny)]; });
+        {
+            int8_t n = at(nx, ny);
+
+            if (n == DEPOSITED || n == PASSIVATED)
+                coord++;
+
+            e += energy_lookup_[atom_type][n];
+        });
+
+        e += bond_energy(coord);
+
         return e;
+    }
+
+    int coordination_number(int x, int y) const
+    {
+        int coord = 0;
+
+        for_each_neighbour(x, y, [&](int nx, int ny)
+        {
+            int8_t s = at(nx, ny);
+
+            if (s == DEPOSITED || s == PASSIVATED)
+                coord++;
+        });
+
+        return coord;
+    }
+
+    double bond_energy(int coordination) const
+    {
+        // Simple version
+
+        return p_.e0 * coordination;
     }
 
     double get_event_rate(const Event &ev) const
@@ -759,14 +794,11 @@ private:
             if (at(x1, y1) != EMPTY)
                 return 0.0;
 
-            double neighbors = 0;
+            int coord = coordination_number(x1,y1);
 
-            for_each_neighbour(x1, y1, [&](int nx, int ny)
-                               {
-                if(at(nx,ny)==DEPOSITED)
-                    neighbors++; });
-
-            return p_.d0 * (1.0 + 2.0 * neighbors);
+            return
+            p_.d0 *
+            (1.0 + 0.35 * coord);
         }
 
         int x0 = ev.sx, y0 = ev.sy;
@@ -785,9 +817,13 @@ private:
                     exposed = true;
                     empty_neighbors++;
                 } });
+            int coord = coordination_number(x0,y0);
             if (!exposed)
                 return 0.0;
-            double barrier = p_.E_pass;
+            double barrier =
+            p_.E_pass
+            +0.02*coord
+            -0.03*empty_neighbors;
             // More exposed surface atoms passivate faster
             double surface_factor = 1.0 + 0.25 * empty_neighbors;
             return p_.nu_p *
@@ -806,13 +842,23 @@ private:
 
         double nu = (atype == FREE) ? p_.nu_f : p_.nu_d;
         double e_init = calc_local_energy(x0, y0, atype);
+        int coord_initial = coordination_number(x0, y0);
 
         // Temporarily remove atom to compute destination energy.
         const_cast<ElectrodepositionKMC *>(this)->at(x0, y0) = EMPTY;
         double e_final = calc_local_energy(x1, y1, atype);
+        int coord_final = coordination_number(x1, y1);
         const_cast<ElectrodepositionKMC *>(this)->at(x0, y0) = atype;
 
-        return nu * std::exp(-(e_final - e_init) / (2.0 * p_.kB * p_.T));
+        double barrier =
+        0.03 *
+        (coord_initial - coord_final);
+
+        return
+        nu *
+        exp(-(e_final-e_init + barrier)
+        /
+        (2.0 * p_.kB * p_.T));
     }
 
     void update_rate_at(int idx)
@@ -1327,8 +1373,7 @@ private:
     PCG64 rng_;
 
     std::vector<int8_t> lattice_; // [y*Nx + x]
-    double energy_lookup_[4][4];
-
+    double energy_lookup_[5][5];
     int num_drop_;
     int num_hop_;
     int max_events_;
