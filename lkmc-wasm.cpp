@@ -203,14 +203,14 @@ struct KMCParams
     int Nx = 100;
     int Ny = 100;
     int material = 4; // Default material: 4 (Lithium)
-    double T = 350.0;
-    double d0 = 5e3;
-    double e0 = -0.08;
-    double e1 = -0.25;
-    double nu_f = 1e10;
-    double nu_d = 5e10;
-    double nu_p = 1e9;
-    double E_pass = 0.15;          // passivation activation barrier (eV)
+    double T = 300.0;
+    double d0 = 1000.0;
+    double e0 = -0.28;
+    double e1 = -0.50;
+    double nu_f = 5e9;
+    double nu_d = 5e9;
+    double nu_p = 2e8;
+    double E_pass = 0.40;          // passivation activation barrier (eV)
     double kB = 8.617333262145e-5; // eV / K
     int max_steps = 400000;
     double max_time = 100.0;
@@ -459,14 +459,14 @@ MaterialProperties get_material(int id)
 {
     switch(id)
     {
-        // Lithium (Li) - Default Material
+        // Lithium (Li) - Default Material with exact UI default parameters
         case 4:
             return {
-                -0.20,   // atom-atom bonding (eV)
+                -0.28,   // atom-atom bonding (eV)
                 -0.50,   // substrate bonding (eV)
                 5e9,     // fast hopping / surface diffusion rate (s^-1)
-                1e9,     // detachment rate (s^-1)
-                0.25     // passivation activation barrier (eV)
+                5e9,     // detachment rate (s^-1)
+                0.40     // passivation activation barrier (eV)
             };
 
         // Copper
