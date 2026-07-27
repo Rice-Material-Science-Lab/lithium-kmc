@@ -1076,15 +1076,6 @@ public:
         std::vector<std::pair<int, int>> all_changed = directly_changed;
         all_changed.insert(all_changed.end(), relaxed.begin(), relaxed.end());
         refresh_local_rates(all_changed);
-        if (step_ % 10000 == 0)
-        {
-            printf(
-                "step=%d rate=%e dt=%e time=%e\n",
-                step_,
-                r_tot,
-                dt,
-                time_);
-        }
         time_ += dt;
         ++step_;
         if(step_ % 10000 == 0)
