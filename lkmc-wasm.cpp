@@ -4,7 +4,7 @@
  * WASM version of C++ port of LKMC_v2_commented_b.py.
  *
  *  * Build:
- * emcc lkmc-wasm.cpp -o public/lkmc-wasm.js -O3 -fexceptions -sEXPORT_ES6 -sMODULARIZE -sEXPORTED_FUNCTIONS="['_set_params','_init_simulation','_run_steps','_get_lattice_data','_get_lattice','_get_lattice_size','_get_width','_get_height','_get_step','_get_time','_get_fill','_get_stats_json','_get_passivated','_cleanup_simulation','_force_update_frontend']" -sEXPORTED_RUNTIME_METHODS="['ccall','cwrap','HEAP8','wasmMemory']"
+ * emcc lkmc-wasm.cpp -o public/lkmc-wasm.js -O3 -fexceptions -sEXPORT_ES6 -sMODULARIZE -sEXPORTED_FUNCTIONS="['_set_params','_init_simulation','_run_steps','_get_lattice_data','_get_lattice','_get_lattice_size','_get_width','_get_height','_get_step', '_get_wall_time', '_get_time','_get_fill','_get_stats_json','_get_passivated','_cleanup_simulation','_force_update_frontend']" -sEXPORTED_RUNTIME_METHODS="['ccall','cwrap','HEAP8','wasmMemory']"
  * Exported WASM stuff:
  *   _set_params(int Nx, int Ny, double d0, double T, double e0, double e1, double nu_f, double nu_d, int seed)
  *   _init_simulation()
@@ -204,11 +204,11 @@ struct KMCParams
     int Ny = 100;
     int material = 3; // Default material: 3 (Lithium)
     double T = 300.0;
-    double d0 = 1000.0;
+    double d0 = 1e9;
     double e0 = -0.28;
     double e1 = -0.50;
-    double nu_f = 5e9;
-    double nu_d = 5e9;
+    double nu_f = 1e9;
+    double nu_d = 1e9;
     double nu_p = 2e8;
     double E_pass = 0.40;          // passivation activation barrier (eV)
     double kB = 8.617333262145e-5; // eV / K
@@ -546,6 +546,8 @@ public:
         if (p_.T <= 0)
             throw std::invalid_argument("T must be positive.");
 
+        wall_start_ = std::chrono::steady_clock::now();
+
         // Substrate row (row 0).
         for (int x = 0; x < p_.Nx; ++x)
             at(x, 0) = SUBSTRATE;
@@ -638,6 +640,12 @@ public:
 
     int step() const { return step_; }
     double time() const { return time_; }
+    double wall_time() const
+    {
+        return std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - wall_start_
+        ).count();
+    }
 
 private:
     // -----------------------------------------------------------------------
@@ -794,11 +802,16 @@ private:
             if (at(x1, y1) != EMPTY)
                 return 0.0;
 
-            int coord = coordination_number(x1,y1);
+            int coord = coordination_number(x1, y1);
 
-            return
-            p_.d0 *
-            (1.0 + 0.35 * coord);
+            // adsorption barrier decreases with coordination
+            double E_dep = 0.15 - 0.02 * coord;
+
+            // don't let the barrier become negative
+            if (E_dep < 0.02)
+                E_dep = 0.02;
+
+            return p_.d0 * std::exp(-E_dep / (p_.kB * p_.T));
         }
 
         int x0 = ev.sx, y0 = ev.sy;
@@ -850,15 +863,16 @@ private:
         int coord_final = coordination_number(x1, y1);
         const_cast<ElectrodepositionKMC *>(this)->at(x0, y0) = atype;
 
-        double barrier =
-        0.03 *
-        (coord_initial - coord_final);
+        double Ea = 0.15;        // base diffusion barrier
 
-        return
-        nu *
-        exp(-(e_final-e_init + barrier)
+        double barrier =
+        Ea +
+        0.03 * std::max(0, coord_initial - coord_final);
+
+        return nu *
+        std::exp(-(barrier + std::max(0.0, e_final - e_init))
         /
-        (2.0 * p_.kB * p_.T));
+        (p_.kB * p_.T));
     }
 
     void update_rate_at(int idx)
@@ -1061,7 +1075,15 @@ public:
         std::vector<std::pair<int, int>> all_changed = directly_changed;
         all_changed.insert(all_changed.end(), relaxed.begin(), relaxed.end());
         refresh_local_rates(all_changed);
-
+        if (step_ % 10000 == 0)
+        {
+            printf(
+                "step=%d rate=%e dt=%e time=%e\n",
+                step_,
+                r_tot,
+                dt,
+                time_);
+        }
         time_ += dt;
         ++step_;
         if(step_ % 10000 == 0)
@@ -1371,6 +1393,7 @@ private:
     // -----------------------------------------------------------------------
     KMCParams p_;
     PCG64 rng_;
+    std::chrono::steady_clock::time_point wall_start_;
 
     std::vector<int8_t> lattice_; // [y*Nx + x]
     double energy_lookup_[5][5];
@@ -1561,6 +1584,14 @@ extern "C"
         if (!wasm_sim)
             return 0.0;
         return wasm_sim->time();
+    }
+
+    EMSCRIPTEN_KEEPALIVE
+    double get_wall_time()
+    {
+        if (!wasm_sim)
+            return 0.0;
+        return wasm_sim->wall_time();
     }
 
     EMSCRIPTEN_KEEPALIVE
