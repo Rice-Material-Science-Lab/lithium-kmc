@@ -4,9 +4,10 @@
  * WASM version of C++ port of LKMC_v2_commented_b.py.
  *
  *  * Build:
- * emcc lkmc-wasm.cpp -o public/lkmc-wasm.js -O3 -fexceptions -sEXPORT_ES6 -sMODULARIZE -sEXPORTED_FUNCTIONS="['_set_params','_init_simulation','_run_steps','_get_lattice_data','_get_lattice','_get_lattice_size','_get_width','_get_height','_get_step', '_get_wall_time', '_get_time','_get_fill','_get_stats_json','_get_passivated','_cleanup_simulation','_force_update_frontend']" -sEXPORTED_RUNTIME_METHODS="['ccall','cwrap','HEAP8','wasmMemory']"
+ * emcc lkmc-wasm.cpp -o public/lkmc-wasm.js -O3 -fexceptions -sEXPORT_ES6 -sMODULARIZE -sEXPORTED_FUNCTIONS="['_set_params', '_update_simulation_params', '_init_simulation','_run_steps','_get_lattice_data','_get_lattice','_get_lattice_size','_get_width','_get_height','_get_step', '_get_wall_time', '_get_time','_get_fill','_get_stats_json','_get_passivated','_cleanup_simulation','_force_update_frontend']" -sEXPORTED_RUNTIME_METHODS="['ccall','cwrap','HEAP8','wasmMemory']"
  * Exported WASM stuff:
  *   _set_params(int Nx, int Ny, double d0, double T, double e0, double e1, double nu_f, double nu_d, int seed)
+ *   _update_simulation_params(double d0, double T, double nu_f, double nu_d, double nu_p, double E_pass)
  *   _init_simulation()
  *   _run_steps(int steps)
  *   _get_lattice_data()
@@ -1092,6 +1093,25 @@ public:
         }
         return true;
     }
+    void update_params(
+        double d0,
+        double T,
+        double nu_f,
+        double nu_d,
+        double nu_p,
+        double E_pass
+    )
+    {
+        p_.d0 = d0;
+        p_.T = T;
+        p_.nu_f = nu_f;
+        p_.nu_d = nu_d;
+        p_.nu_p = nu_p;
+        p_.E_pass = E_pass;
+
+        // Important: old rates are now invalid
+        rebuild_all_rates();
+    }
     int passivated_count() const
     {
         int count = 0;
@@ -1453,6 +1473,29 @@ extern "C"
         wasm_params.rng_seed = seed;
 
         wasm_params.pcg.seed((uint64_t)seed);
+    }
+
+    EMSCRIPTEN_KEEPALIVE
+    void update_simulation_params(
+        double d0,
+        double T,
+        double nu_f,
+        double nu_d,
+        double nu_p,
+        double E_pass
+    )
+    {
+        if (!wasm_sim)
+            return;
+
+        wasm_sim->update_params(
+            d0,
+            T,
+            nu_f,
+            nu_d,
+            nu_p,
+            E_pass
+        );
     }
 
     EMSCRIPTEN_KEEPALIVE
