@@ -204,7 +204,7 @@ struct KMCParams
     int Ny = 100;
     int material = 3; // Default material: 3 (Lithium)
     double T = 300.0;
-    double d0 = 1000.0;
+    double d0 = 5e9;
     double e0 = -0.28;
     double e1 = -0.50;
     double nu_f = 5e9;
@@ -794,11 +794,16 @@ private:
             if (at(x1, y1) != EMPTY)
                 return 0.0;
 
-            int coord = coordination_number(x1,y1);
+            int coord = coordination_number(x1, y1);
 
-            return
-            p_.d0 *
-            (1.0 + 0.35 * coord);
+            // adsorption barrier decreases with coordination
+            double E_dep = 0.15 - 0.02 * coord;
+
+            // don't let the barrier become negative
+            if (E_dep < 0.02)
+                E_dep = 0.02;
+
+            return p_.d0 * std::exp(-E_dep / (p_.kB * p_.T));
         }
 
         int x0 = ev.sx, y0 = ev.sy;
@@ -850,15 +855,16 @@ private:
         int coord_final = coordination_number(x1, y1);
         const_cast<ElectrodepositionKMC *>(this)->at(x0, y0) = atype;
 
-        double barrier =
-        0.03 *
-        (coord_initial - coord_final);
+        double Ea = 0.08;        // base diffusion barrier
 
-        return
-        nu *
-        exp(-(e_final-e_init + barrier)
+        double barrier =
+        Ea +
+        0.03 * std::max(0, coord_initial - coord_final);
+
+        return nu *
+        std::exp(-(barrier + std::max(0.0, e_final - e_init))
         /
-        (2.0 * p_.kB * p_.T));
+        (p_.kB * p_.T));
     }
 
     void update_rate_at(int idx)
@@ -1061,7 +1067,15 @@ public:
         std::vector<std::pair<int, int>> all_changed = directly_changed;
         all_changed.insert(all_changed.end(), relaxed.begin(), relaxed.end());
         refresh_local_rates(all_changed);
-
+        if (step_ % 10000 == 0)
+        {
+            printf(
+                "step=%d rate=%e dt=%e time=%e\n",
+                step_,
+                r_tot,
+                dt,
+                time_);
+        }
         time_ += dt;
         ++step_;
         if(step_ % 10000 == 0)
