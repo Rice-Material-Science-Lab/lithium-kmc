@@ -205,7 +205,7 @@ struct KMCParams
     int Ny = 100;
     int material = 3; // Default material: 3 (Lithium)
     double T = 300.0;
-    double d0 = 1000.0;
+    double d0 = 5e9;
     double e0 = -0.28;
     double e1 = -0.50;
     double nu_f = 5e9;
