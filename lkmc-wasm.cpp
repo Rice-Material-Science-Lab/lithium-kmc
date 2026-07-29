@@ -4,7 +4,7 @@
  * WASM version of C++ port of LKMC_v2_commented_b.py.
  *
  *  * Build:
- * emcc lkmc-wasm.cpp -o public/lkmc-wasm.js -O3 -fexceptions -sEXPORT_ES6 -sMODULARIZE -sEXPORTED_FUNCTIONS="['_set_params', '_update_simulation_params', '_init_simulation','_run_steps','_get_lattice_data','_get_lattice','_get_lattice_size','_get_width','_get_height','_get_step', '_get_wall_time', '_get_time','_get_fill','_get_stats_json','_get_passivated','_cleanup_simulation','_force_update_frontend']" -sEXPORTED_RUNTIME_METHODS="['ccall','cwrap','HEAP8','wasmMemory']"
+ * emcc lkmc-wasm.cpp -o public/lkmc-wasm.js -O3 -fexceptions -sEXPORT_ES6 -sMODULARIZE -sEXPORTED_FUNCTIONS="['_set_params','_update_simulation_params','_init_simulation','_run_steps','_play','_pause','_stop','_step_once','_playback_tick','_set_batch_size','_set_stats_interval','_get_playback_state','_get_lattice_data','_get_lattice','_get_lattice_size','_get_width','_get_height','_get_step','_get_wall_time','_get_time','_get_fill','_get_stats_json','_get_passivated','_cleanup_simulation','_force_update_frontend']" -sEXPORTED_RUNTIME_METHODS="['ccall','cwrap','HEAP8','wasmMemory']"
  * Exported WASM stuff:
  *   _set_params(int Nx, int Ny, double d0, double T, double e0, double e1, double nu_f, double nu_d, int seed)
  *   _update_simulation_params(double d0, double T, double nu_f, double nu_d, double nu_p, double E_pass)
@@ -1076,7 +1076,7 @@ public:
         refresh_local_rates(all_changed);
         time_ += dt;
         ++step_;
-        if(step_ % 10000 == 0)
+        if(step_ % stats_interval_ == 0)
         {
             record_stats();
         }
@@ -1156,6 +1156,63 @@ public:
         int total_sites = p_.Nx * p_.Ny;
 
         return 100.0 * deposited / total_sites;
+    }
+    void play()
+    {
+        playback_state_ = PlaybackState::PLAYING;
+    }
+
+    void pause()
+    {
+        playback_state_ = PlaybackState::PAUSED;
+    }
+
+    void stop()
+    {
+        playback_state_ = PlaybackState::STOPPED;
+        stop_requested_ = true;
+    }
+
+    void step_once()
+    {
+        execute_step();
+    }
+
+    void playback_tick()
+    {
+        if(playback_state_ != PlaybackState::PLAYING)
+            return;
+
+        for(int i = 0; i < playback_batch_; i++)
+        {
+            if(stop_requested_)
+            {
+                stop_requested_ = false;
+                playback_state_ = PlaybackState::STOPPED;
+                break;
+            }
+
+            if(!execute_step())
+            {
+                playback_state_ = PlaybackState::STOPPED;
+                break;
+            }
+        }
+    }
+
+    void set_batch_size(int batch)
+    {
+        playback_batch_ = std::max(1, batch);
+    }
+
+    void set_stats_interval(int interval)
+    {
+        stats_interval_ = std::max(1, interval);
+    }
+
+    int playback_state() const
+    {
+        return static_cast<int>(playback_state_);
     }
 
 private:
@@ -1417,6 +1474,20 @@ private:
     double time_ = 0.0;
     int step_ = 0;
     bool parameters_changed_ = false;
+    enum class PlaybackState
+    {
+        STOPPED,
+        PLAYING,
+        PAUSED
+    };
+
+    PlaybackState playback_state_ = PlaybackState::STOPPED;
+
+    bool stop_requested_ = false;
+
+    int playback_batch_ = 100;
+
+    int stats_interval_ = 10000;
 #ifndef __EMSCRIPTEN__
     fs::path out_dir_;
 #endif
@@ -1509,10 +1580,6 @@ extern "C"
             printf("CRITICAL ERROR: wasm_sim is NULL at the start of run_steps!\n");
             return;
         }
-
-        int max_batch = 5000;
-        if (steps > max_batch)
-            steps = max_batch;
 
         for (int i = 0; i < steps; i++)
         {
@@ -1625,6 +1692,61 @@ extern "C"
         if (!wasm_sim)
             return 0.0;
         return wasm_sim->wall_time();
+    }
+
+    EMSCRIPTEN_KEEPALIVE
+    void play()
+    {
+        if(wasm_sim)
+            wasm_sim->play();
+    }
+
+    EMSCRIPTEN_KEEPALIVE
+    void pause()
+    {
+        if(wasm_sim)
+            wasm_sim->pause();
+    }
+
+    EMSCRIPTEN_KEEPALIVE
+    void stop()
+    {
+        if(wasm_sim)
+            wasm_sim->stop();
+    }
+
+    EMSCRIPTEN_KEEPALIVE
+    void step_once()
+    {
+        if(wasm_sim)
+            wasm_sim->step_once();
+    }
+
+    EMSCRIPTEN_KEEPALIVE
+    void playback_tick()
+    {
+        if(wasm_sim)
+            wasm_sim->playback_tick();
+    }
+
+    EMSCRIPTEN_KEEPALIVE
+    void set_batch_size(int batch)
+    {
+        if(wasm_sim)
+            wasm_sim->set_batch_size(batch);
+    }
+
+    EMSCRIPTEN_KEEPALIVE
+    void set_stats_interval(int interval)
+    {
+        if(wasm_sim)
+            wasm_sim->set_stats_interval(interval);
+    }
+
+    EMSCRIPTEN_KEEPALIVE
+    int get_playback_state()
+    {
+        return wasm_sim ? wasm_sim->playback_state() : 0;
     }
 
     EMSCRIPTEN_KEEPALIVE
