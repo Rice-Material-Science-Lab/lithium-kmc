@@ -1580,10 +1580,7 @@ extern "C"
             printf("CRITICAL ERROR: wasm_sim is NULL at the start of run_steps!\n");
             return;
         }
-        int max_batch = 5000;
-        if (steps < max_batch)
-            steps = max_batch;
-            
+
         for (int i = 0; i < steps; i++)
         {
             bool success = false;
