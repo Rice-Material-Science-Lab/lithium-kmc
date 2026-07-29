@@ -1016,6 +1016,11 @@ public:
     // -----------------------------------------------------------------------
     bool execute_step()
     {
+        if(parameters_changed_)
+        {
+            rebuild_all_rates();
+            parameters_changed_ = false;
+        }
         double r_tot = ftree_.total();
         if (r_tot <= 0.0)
             return false;
@@ -1094,7 +1099,7 @@ public:
         p_.E_pass = E_pass;
 
         // Important: old rates are now invalid
-        rebuild_all_rates();
+        parameters_changed_ = true;
     }
     int passivated_count() const
     {
@@ -1411,6 +1416,7 @@ private:
 
     double time_ = 0.0;
     int step_ = 0;
+    bool parameters_changed_ = false;
 #ifndef __EMSCRIPTEN__
     fs::path out_dir_;
 #endif
