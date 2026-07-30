@@ -4,10 +4,10 @@
  * WASM version of C++ port of LKMC_v2_commented_b.py.
  *
  *  * Build:
- * emcc lkmc-wasm.cpp -o public/lkmc-wasm.js -O3 -fexceptions -sEXPORT_ES6 -sMODULARIZE -sEXPORTED_FUNCTIONS="['_set_params','_update_simulation_params','_init_simulation','_run_steps','_play','_pause','_stop','_step_once','_playback_tick','_set_batch_size','_set_stats_interval','_get_playback_state','_get_lattice_data','_get_lattice','_get_lattice_size','_get_width','_get_height','_get_step','_get_wall_time','_get_time','_get_fill','_get_stats_json','_get_passivated','_cleanup_simulation','_force_update_frontend']" -sEXPORTED_RUNTIME_METHODS="['ccall','cwrap','HEAP8','wasmMemory']"
+ * emcc lkmc-wasm.cpp -o public/lkmc-wasm.js -O3 -fexceptions -sINITIAL_MEMORY=268435456 -sEXPORT_ES6 -sMODULARIZE -sEXPORTED_FUNCTIONS="['_set_params','_update_simulation_params','_init_simulation','_run_steps','_play','_pause','_stop','_step_once','_playback_tick','_set_batch_size','_set_stats_interval','_get_playback_state','_get_lattice_data','_get_lattice','_get_lattice_size','_get_width','_get_height','_get_step','_get_wall_time','_get_time','_get_fill','_get_stats_json','_get_stats_json_len','_get_passivated','_cleanup_simulation','_force_update_frontend']" -sEXPORTED_RUNTIME_METHODS="['ccall','cwrap','HEAP8','wasmMemory']"
  * Exported WASM stuff:
- *   _set_params(int Nx, int Ny, double d0, double T, double e0, double e1, double nu_f, double nu_d, int seed)
- *   _update_simulation_params(double d0, double T, double nu_f, double nu_d, double nu_p, double E_pass)
+ *   _set_params(int Nx, int Ny, double d0, double T, double e0, double e1, double nu_f, double nu_d, int seed) 
+ *   _update_simulation_params(double d0, double T, double nu_f, double nu_d, double nu_p)
  *   _init_simulation()
  *   _run_steps(int steps)
  *   _get_lattice_data()
@@ -35,7 +35,6 @@
  *   nu_f        = 5e9
  *   nu_d        = 1e9
  *   nu_p        = 1e6
- *   E_pass      = 0.25
  *   max_steps   = 400000
  *   max_time    = 100.0
  *   rng_seed    = 394583
@@ -89,7 +88,8 @@ namespace fs = std::filesystem;
 #endif
 
 // ---------------------------------------------------------------------------
-// PCG64 — identical to numpy.random.default_rng() draw sequence.
+// PCG64 compatible output generator.
+// Exact NumPy PCG64 reproduction requires importing the state/inc values.
 //
 // numpy uses PCG64 with a 128-bit LCG and XSL-RR output function.
 // This class reproduces exactly the same sequence when initialized with
@@ -203,15 +203,14 @@ struct KMCParams
 {
     int Nx = 100;
     int Ny = 100;
-    int material = 3; // Default material: 3 (Lithium)
     double T = 300.0;
     double d0 = 1000.0;
     double e0 = -0.28;
     double e1 = -0.50;
-    double nu_f = 5e9;
-    double nu_d = 5e9;
-    double nu_p = 2e8;
-    double E_pass = 0.40;          // passivation activation barrier (eV)
+    double nu_f = 5e7;
+    double nu_d = 1e7;
+    double nu_p = 1e6;
+    double e_pass = 0.4; // eV — passivation activation energy barrier
     double kB = 8.617333262145e-5; // eV / K
     int max_steps = 400000;
     double max_time = 100.0;
@@ -223,7 +222,7 @@ struct KMCParams
     PCG64State pcg = {}; // default-constructed to seed=394583 values
     bool periodic_x = true;
     int log_every = 1000;
-    int snapshot_every = 10000;
+    int snapshot_every = 100;
     bool save_snapshots = true;
     bool save_npy = true;
     std::string output_dir = "kmc_output";
@@ -296,8 +295,6 @@ KMCParams load_config(const std::string &path, KMCParams p = {})
             p.Nx = toInt(val, p.Nx);
         else if (key == "Ny")
             p.Ny = toInt(val, p.Ny);
-        else if (key == "material")
-            p.material = toInt(val, p.material);
         else if (key == "T")
             p.T = toDouble(val, p.T);
         else if (key == "d0")
@@ -312,8 +309,6 @@ KMCParams load_config(const std::string &path, KMCParams p = {})
             p.nu_d = toDouble(val, p.nu_d);
         else if (key == "nu_p")
             p.nu_p = toDouble(val, p.nu_p);
-        else if (key == "E_pass")
-            p.E_pass = toDouble(val, p.E_pass);
         else if (key == "max_steps")
             p.max_steps = toInt(val, p.max_steps);
         else if (key == "max_time")
@@ -400,7 +395,11 @@ public:
             }
             bit >>= 1;
         }
-        return idx; // 0-based
+        // Clamp: idx here is 0-based "last index whose prefix < target",
+        // so the returned event index is idx, but it must never reach size_.
+        if (idx >= size_)
+            idx = size_ - 1;
+        return idx;
     }
 
 private:
@@ -413,9 +412,10 @@ private:
 // ---------------------------------------------------------------------------
 struct Event
 {
-    bool is_drop;   // true => drop event; false => hop event
-    int16_t sx, sy; // source site  (valid only for hops)
-    int16_t dx, dy; // destination site raw (before x-wrap)
+    bool is_drop;
+    bool is_passivation;
+    int16_t sx, sy;
+    int16_t dx, dy;
 };
 
 // for stats stuff
@@ -431,6 +431,8 @@ struct StatsRow
     int substrate;
     double fill;
     double total_rate;
+    double e_pass_used;   // debug: the e_pass value active at this step
+    double nu_p_used;     // debug: the nu_p value active at this step
 };
 
 // ---------------------------------------------------------------------------
@@ -446,74 +448,7 @@ struct HistoryRow
     int n_total;
     double total_rate;
 };
-struct MaterialProperties
-{
-    double e0;
-    double e1;
-    double nu_f;
-    double nu_d;
-    double E_pass;
-    // Additional material properties (not currently used in the simulation)
-    double surface_energy;        // J/m²
-    double activation_diffusion;  // eV
-    double activation_attach;     // eV
-    double activation_detach;     // eV
-    double lattice_constant;      // nm
-    double atomic_volume;         // m³
-    double exchange_current;      // A/m²
-    double transfer_coeff;        // Butler-Volmer α
-    int crystal_type;             // FCC/BCC/HCP
-};
 
-// None of the params are set for sure rn
-MaterialProperties get_material(int id)
-{
-    switch(id)
-    {
-        // Lithium (Li) - Default Material with exact UI default parameters
-        case 3:
-            return {
-                -0.28,   // atom-atom bonding (eV)
-                -0.50,   // substrate bonding (eV)
-                5e9,     // fast hopping / surface diffusion rate (s^-1)
-                5e9,     // detachment rate (s^-1)
-                0.40     // passivation activation barrier (eV)
-            };
-
-        // Copper
-        case 0:
-            return {
-                -0.08,   // atom-atom bonding
-                -0.25,   // substrate bonding
-                1e10,    // deposition
-                5e10,    // diffusion
-                0.15     // passivation
-            };
-
-        // Silver
-        case 1:
-            return {
-                -0.05,
-                -0.20,
-                8e9,
-                3e10,
-                0.10
-            };
-
-        // Nickel
-        case 2:
-            return {
-                -0.15,
-                -0.35,
-                2e10,
-                8e10,
-                0.25
-            };
-
-        default:
-            return get_material(3);
-    }
-}
 // ---------------------------------------------------------------------------
 // Main simulator class (mirrors ElectrodepositionKMC)
 // ---------------------------------------------------------------------------
@@ -532,13 +467,6 @@ public:
           ftree_(p.Nx + p.Nx * p.Ny * 7),
           idx_to_event_(p.Nx + p.Nx * p.Ny * 7)
     {
-        auto mat = get_material(p_.material);
-
-        p_.e0 = mat.e0;
-        p_.e1 = mat.e1;
-        p_.nu_f = mat.nu_f;
-        p_.nu_d = mat.nu_d;
-        p_.E_pass = mat.E_pass;
         // Validate.
         if (p_.Nx < 1)
             throw std::invalid_argument("Nx must be >= 1.");
@@ -564,6 +492,14 @@ public:
         energy_lookup_[DEPOSITED][SUBSTRATE] = p_.e1;
         energy_lookup_[SUBSTRATE][DEPOSITED] = p_.e1;
         energy_lookup_[SUBSTRATE][SUBSTRATE] = p_.e1;
+        // PASSIVATED interacts exactly like DEPOSITED
+        energy_lookup_[FREE][PASSIVATED] = p_.e0;
+        energy_lookup_[PASSIVATED][FREE] = p_.e0;
+        energy_lookup_[DEPOSITED][PASSIVATED] = p_.e0;
+        energy_lookup_[PASSIVATED][DEPOSITED] = p_.e0;
+        energy_lookup_[PASSIVATED][PASSIVATED] = p_.e0;
+        energy_lookup_[PASSIVATED][SUBSTRATE] = p_.e1;
+        energy_lookup_[SUBSTRATE][PASSIVATED] = p_.e1;
 
 // Prepare output directory.
 #ifndef __EMSCRIPTEN__
@@ -572,6 +508,17 @@ public:
         if (p_.save_snapshots)
             fs::create_directories(out_dir_ / "snapshots");
 #endif
+        // Pre-size reusable scratch buffers once, up front, so steady-state
+        // simulation never triggers a vector/map reallocation.
+        refresh_visited_.assign((size_t)p_.Nx * p_.Ny, false);
+        relax_in_queue_.assign((size_t)p_.Nx * p_.Ny, false);
+        refresh_targets_.reserve(64);
+        refresh_bfs_queue_.reserve(64);
+        relax_queue_.reserve(64);
+        relax_changed_.reserve(64);
+        step_directly_changed_.reserve(4);
+        step_all_changed_.reserve(64);
+
         // Build event index table.
         setup_indices();
 
@@ -620,12 +567,32 @@ public:
             if (!execute_step())
                 break;
             if (step_ % p_.log_every == 0)
+            {
                 record_history("regular");
+
+                std::cout
+                    << "step=" << step_
+                    << " time=" << std::scientific << time_
+                    << " fill=" << fill_percentage()
+                    << "% rate=" << ftree_.total()
+                    << "\n";
+            }
 #ifndef __EMSCRIPTEN__
             if (p_.save_snapshots && step_ % p_.snapshot_every == 0)
             {
                 char tag[32];
                 snprintf(tag, sizeof(tag), "step_%07d", step_);
+
+                std::cout 
+                    << "Saving snapshot: "
+                    << tag
+                    << "  step="
+                    << step_
+                    << "  time="
+                    << std::scientific
+                    << time_
+                    << std::endl;
+
                 save_snapshot(tag);
             }
             if (p_.save_npy && step_ % p_.snapshot_every == 0)
@@ -709,7 +676,15 @@ private:
         // Drop events: indices [0, Nx)
         for (int x = 0; x < p_.Nx; ++x)
         {
-            idx_to_event_[x] = {true, 0, 0, (int16_t)x, (int16_t)top_y};
+            idx_to_event_[x] =
+            {
+                true,
+                false,
+                0,
+                0,
+                (int16_t)x,
+                (int16_t)top_y
+            };
         }
         int base = num_drop_;
         for (int y = 0; y < p_.Ny; ++y)
@@ -724,21 +699,27 @@ private:
                     const int *DX = (y & 1) ? ODD_DX : EVEN_DX;
                     const int *DY = (y & 1) ? ODD_DY : EVEN_DY;
 
-                    idx_to_event_[idx] = {
+                    idx_to_event_[idx] =
+                    {
+                        false,
                         false,
                         (int16_t)x,
                         (int16_t)y,
                         (int16_t)(x + DX[d]),
-                        (int16_t)(y + DY[d])};
+                        (int16_t)(y + DY[d])
+                    };
                 }
 
                 // passivation event
-                idx_to_event_[base + site_off + 6] = {
+                idx_to_event_[base + site_off + 6] =
+                {
                     false,
+                    true,
                     (int16_t)x,
                     (int16_t)y,
                     0,
-                    0};
+                    0
+                };
             }
         }
     }
@@ -767,8 +748,6 @@ private:
 
             e += energy_lookup_[atom_type][n];
         });
-
-        e += bond_energy(coord);
 
         return e;
     }
@@ -799,22 +778,32 @@ private:
     {
         if (ev.is_drop)
         {
-            int x1 = ev.dx, y1 = ev.dy;
+            int x1 = ev.dx;
+            int y1 = ev.dy;
+
             if (at(x1, y1) != EMPTY)
                 return 0.0;
 
-            int coord = coordination_number(x1,y1);
-            return
-            p_.d0 *
-            (1.0 + 0.35 * coord);
+            int coord = coordination_number(x1, y1);
+
+            double E_dep = 0.15 - 0.02 * coord;
+
+            if(E_dep < 0.02)
+                E_dep = 0.02;
+
+            return p_.d0 *
+                exp(
+                    -E_dep /
+                    (p_.kB * p_.T)
+                );
         }
 
         int x0 = ev.sx, y0 = ev.sy;
         int8_t atype = at(x0, y0);
         // passivation event
-        if (ev.dx == 0 && ev.dy == 0)
+        if(ev.is_passivation)
         {
-            if (atype != DEPOSITED && atype != FREE)
+            if (atype != DEPOSITED)
                 return 0.0;
             // Passivation only occurs on exposed deposited atoms
             bool exposed = false;
@@ -828,15 +817,12 @@ private:
             int coord = coordination_number(x0,y0);
             if (!exposed)
                 return 0.0;
-            double barrier =
-            p_.E_pass
-            +0.02*coord
-            -0.03*empty_neighbors;
-            // More exposed surface atoms passivate faster
-            double surface_factor = 1.0 + 0.25 * empty_neighbors;
+            // Apply the same Boltzmann suppression as hop/drop events so
+            // passivation competes fairly with growth instead of
+            // dominating regardless of temperature.
             return p_.nu_p *
-                   surface_factor *
-                   std::exp(-barrier / (p_.kB * p_.T));
+                exp(-p_.e_pass / (p_.kB * p_.T)) *
+                (empty_neighbors / 3.0);
         }
         if (atype != FREE && atype != DEPOSITED)
             return 0.0;
@@ -853,25 +839,64 @@ private:
         int coord_initial = coordination_number(x0, y0);
 
         // Temporarily remove atom to compute destination energy.
-        const_cast<ElectrodepositionKMC *>(this)->at(x0, y0) = EMPTY;
-        double e_final = calc_local_energy(x1, y1, atype);
+        int8_t old = const_cast<ElectrodepositionKMC *>(this)->at(x0,y0);
+
+        const_cast<ElectrodepositionKMC *>(this)->at(x0,y0) = EMPTY;
+
+        double e_final = calc_local_energy(x1,y1,atype);
+        const_cast<ElectrodepositionKMC *>(this)->at(x0,y0) = old;
+        if(!std::isfinite(e_final) || !std::isfinite(e_init))
+        {
+            const_cast<ElectrodepositionKMC *>(this)->at(x0,y0)=old;
+            return 0.0;
+        }
         int coord_final = coordination_number(x1, y1);
         const_cast<ElectrodepositionKMC *>(this)->at(x0, y0) = atype;
 
         double barrier =
-        0.03 *
-        (coord_initial - coord_final);
+            0.15 + 
+            0.03 * std::max(0, coord_initial - coord_final);
 
-        return
-        nu *
-        exp(-(e_final-e_init + barrier)
-        /
-        (2.0 * p_.kB * p_.T));
+        double energy_penalty = std::max(0.0, e_final - e_init);
+
+        double rate =
+            nu *
+            exp(
+                -(barrier + energy_penalty)
+                /
+                (p_.kB * p_.T)
+            );
+
+        return rate;
     }
 
     void update_rate_at(int idx)
     {
         double new_rate = get_event_rate(idx_to_event_[idx]);
+
+        if(!std::isfinite(new_rate))
+        {
+#ifndef __EMSCRIPTEN__
+            printf(
+                "INVALID RATE idx=%d rate=%e\n",
+                idx,
+                new_rate
+            );
+#endif
+            new_rate = 0.0;
+        }
+
+        if(new_rate > 1e100)
+        {
+#ifndef __EMSCRIPTEN__
+            printf(
+                "RATE TOO LARGE idx=%d rate=%e\n",
+                idx,
+                new_rate
+            );
+#endif
+            new_rate = 1e100;
+        }
         double delta = new_rate - event_rates_[idx];
         if (std::abs(delta) > 1.0e-18)
         {
@@ -893,45 +918,44 @@ private:
     // -----------------------------------------------------------------------
     void refresh_local_rates(const std::vector<std::pair<int, int>> &changed)
     {
-        // Collect unique sites within hex distance 2.
-        std::vector<std::pair<int, int>> targets;
-        targets.reserve(changed.size() * 13); // ~13 sites per seed
-
-        // Simple dedup via a flat visited set backed by the lattice index.
-        std::vector<bool> visited(p_.Nx * p_.Ny, false);
-
-        std::queue<std::pair<int, int>> q;
-        std::unordered_map<int, int> dist;
+        // Reuse member scratch buffers instead of allocating fresh
+        // containers every step (prevents WASM heap fragmentation on
+        // very long runs).
+        refresh_targets_.clear();
+        std::fill(refresh_visited_.begin(), refresh_visited_.end(), false);
+        refresh_dist_.clear();
+        refresh_bfs_queue_.clear();
 
         for (auto [sx, sy] : changed)
         {
-            q.push({sx, sy});
-            dist[sy * p_.Nx + sx] = 0;
+            refresh_bfs_queue_.emplace_back(sx, sy);
+            refresh_dist_[sy * p_.Nx + sx] = 0;
         }
-        while (!q.empty())
+
+        size_t head = 0;
+        while (head < refresh_bfs_queue_.size())
         {
-            auto [x, y] = q.front();
-            q.pop();
-            int d = dist[y * p_.Nx + x];
+            auto [x, y] = refresh_bfs_queue_[head++];
+            int d = refresh_dist_[y * p_.Nx + x];
             int linear = y * p_.Nx + x;
-            if (!visited[linear])
+            if (!refresh_visited_[linear])
             {
-                visited[linear] = true;
-                targets.emplace_back(x, y);
+                refresh_visited_[linear] = true;
+                refresh_targets_.emplace_back(x, y);
             }
             if (d == 2)
                 continue;
             for_each_neighbour(x, y, [&](int nx, int ny)
                                {
                     int key = ny * p_.Nx + nx;
-                    if (!dist.count(key)) {
-                        dist[key] = d + 1;
-                        q.push({nx, ny});
+                    if (!refresh_dist_.count(key)) {
+                        refresh_dist_[key] = d + 1;
+                        refresh_bfs_queue_.emplace_back(nx, ny);
                     } });
         }
 
         int top_y = p_.Ny - 1;
-        for (auto [x, y] : targets)
+        for (auto [x, y] : refresh_targets_)
         {
             if (y == top_y)
                 update_rate_at(drop_index(x));
@@ -941,9 +965,8 @@ private:
         }
     }
 
-    // -----------------------------------------------------------------------
-    // Bonding-state relaxation (mirrors update_bonding_relaxation)
-    // -----------------------------------------------------------------------
+    // Writes results into member relax_changed_ instead of returning by
+    // value, so no vector is allocated/copied on every step.
     int8_t desired_bond_state(int x, int y) const
     {
         int8_t st = at(x, y);
@@ -959,22 +982,21 @@ private:
         return bonded ? DEPOSITED : FREE;
     }
 
-    std::vector<std::pair<int, int>> update_bonding_relaxation(
+    void update_bonding_relaxation(
         const std::vector<std::pair<int, int>> &seeds)
     {
-        // BFS queue.
-        std::vector<std::pair<int, int>> queue;
-        std::vector<bool> in_queue(p_.Nx * p_.Ny, false);
-        std::vector<std::pair<int, int>> changed;
+        relax_queue_.clear();
+        std::fill(relax_in_queue_.begin(), relax_in_queue_.end(), false);
+        relax_changed_.clear();
 
         // Seed with each site and its direct neighbours.
         auto enqueue = [&](int x, int y)
         {
             int lin = y * p_.Nx + x;
-            if (!in_queue[lin])
+            if (!relax_in_queue_[lin])
             {
-                in_queue[lin] = true;
-                queue.emplace_back(x, y);
+                relax_in_queue_[lin] = true;
+                relax_queue_.emplace_back(x, y);
             }
         };
         for (auto [sx, sy] : seeds)
@@ -985,11 +1007,11 @@ private:
         }
 
         size_t head = 0;
-        while (head < queue.size())
+        while (head < relax_queue_.size())
         {
-            auto [x, y] = queue[head++];
+            auto [x, y] = relax_queue_[head++];
             int lin = y * p_.Nx + x;
-            in_queue[lin] = false; // allow re-enqueue if needed
+            relax_in_queue_[lin] = false; // allow re-enqueue if needed
 
             int8_t cur = at(x, y);
             if (cur != FREE && cur != DEPOSITED)
@@ -1000,14 +1022,13 @@ private:
                 continue;
 
             at(x, y) = desired;
-            changed.emplace_back(x, y);
+            relax_changed_.emplace_back(x, y);
 
             // Re-enqueue neighbours and self.
             for_each_neighbour(x, y, [&](int nx, int ny)
                                { enqueue(nx, ny); });
             enqueue(x, y);
         }
-        return changed;
     }
 
 public:
@@ -1022,8 +1043,49 @@ public:
             parameters_changed_ = false;
         }
         double r_tot = ftree_.total();
+#ifndef __EMSCRIPTEN__
+        if(step_ % 100 == 0)
+        {
+            printf(
+                "STEP %d RATE %.6e TIME %.6e FILL %.3f%%\n",
+                step_,
+                r_tot,
+                time_,
+                fill_percentage()
+            );
+        }
+#endif
+
         if (r_tot <= 0.0)
+        {
+            std::cerr 
+                << "\nKMC STOP: total event rate reached zero\n"
+                << "step=" << step_
+                << " time=" << time_
+                << "\n";
+
+            int empty = 0;
+            int free = 0;
+            int deposited = 0;
+            int passivated = 0;
+
+            for (auto v : lattice_)
+            {
+                if (v == EMPTY) empty++;
+                else if (v == FREE) free++;
+                else if (v == DEPOSITED) deposited++;
+                else if (v == PASSIVATED) passivated++;
+            }
+
+            std::cerr
+                << "EMPTY=" << empty
+                << " FREE=" << free
+                << " DEPOSITED=" << deposited
+                << " PASSIVATED=" << passivated
+                << "\n";
+
             return false;
+        }
 
         // Time increment.
         double u1 = std::max(rng_.next_double(), 1.0e-15);
@@ -1033,47 +1095,58 @@ public:
         double u2 = std::max(rng_.next_double(), 1.0e-15);
         double target = u2 * r_tot;
         int idx = ftree_.find_prefix_index(target);
+        if (idx < 0) idx = 0;
+        if (idx >= max_events_) idx = max_events_ - 1;
 
         const Event &ev = idx_to_event_[idx];
-        std::vector<std::pair<int, int>> directly_changed;
+        step_directly_changed_.clear();
 
         if (ev.is_drop)
         {
             int x1 = ev.dx, y1 = ev.dy;
             at(x1, y1) = FREE;
-            directly_changed.emplace_back(x1, y1);
+            step_directly_changed_.emplace_back(x1, y1);
         }
         else
         {
             int x0 = ev.sx, y0 = ev.sy;
-            int x1 = wrap_x(ev.dx), y1 = ev.dy;
-            // passivation
-            if (ev.dx == 0 && ev.dy == 0)
+
+            if (ev.is_passivation)
             {
                 if (at(x0, y0) == DEPOSITED)
                 {
                     at(x0, y0) = PASSIVATED;
-                    directly_changed.emplace_back(x0, y0);
+                    step_directly_changed_.emplace_back(x0, y0);
                 }
             }
             else
             {
                 int x1 = wrap_x(ev.dx);
                 int y1 = ev.dy;
+
+                if (x1 == -1 || y1 < 0 || y1 >= p_.Ny)
+                {
+                    // Stale/invalid event (rate table out of sync) — skip safely.
+                    return true;
+                }
+
                 int8_t atype = at(x0, y0);
                 at(x0, y0) = EMPTY;
                 at(x1, y1) = atype;
-                directly_changed.emplace_back(x0, y0);
-                directly_changed.emplace_back(x1, y1);
+                step_directly_changed_.emplace_back(x0, y0);
+                step_directly_changed_.emplace_back(x1, y1);
             }
         }
 
-        auto relaxed = update_bonding_relaxation(directly_changed);
+        update_bonding_relaxation(step_directly_changed_); // fills relax_changed_
 
-        // Merge changed sets.
-        std::vector<std::pair<int, int>> all_changed = directly_changed;
-        all_changed.insert(all_changed.end(), relaxed.begin(), relaxed.end());
-        refresh_local_rates(all_changed);
+        // Merge changed sets (reused buffer, no fresh allocation).
+        step_all_changed_.clear();
+        step_all_changed_.insert(step_all_changed_.end(),
+                                  step_directly_changed_.begin(), step_directly_changed_.end());
+        step_all_changed_.insert(step_all_changed_.end(),
+                                  relax_changed_.begin(), relax_changed_.end());
+        refresh_local_rates(step_all_changed_);
         time_ += dt;
         ++step_;
         if(step_ % stats_interval_ == 0)
@@ -1088,7 +1161,7 @@ public:
         double nu_f,
         double nu_d,
         double nu_p,
-        double E_pass
+        double e_pass
     )
     {
         p_.d0 = d0;
@@ -1096,7 +1169,7 @@ public:
         p_.nu_f = nu_f;
         p_.nu_d = nu_d;
         p_.nu_p = nu_p;
-        p_.E_pass = E_pass;
+        p_.e_pass = e_pass;
 
         // Important: old rates are now invalid
         parameters_changed_ = true;
@@ -1132,7 +1205,9 @@ public:
                 << "\"passivated\":" << s.passivated << ","
                 << "\"substrate\":" << s.substrate << ","
                 << "\"fill\":" << s.fill << ","
-                << "\"total_rate\":" << s.total_rate
+                << "\"total_rate\":" << s.total_rate << ","
+                << "\"e_pass_used\":" << s.e_pass_used << ","
+                << "\"nu_p_used\":" << s.nu_p_used
                 << "}";
 
             if(i + 1 < stats_history_.size())
@@ -1149,7 +1224,11 @@ public:
 
         for (auto v : lattice_)
         {
-            if (v == FREE || v == DEPOSITED)
+            if (
+                v == FREE ||
+                v == DEPOSITED ||
+                v == PASSIVATED
+            )
                 deposited++;
         }
 
@@ -1272,8 +1351,24 @@ private:
             passivated,
             substrate,
             fill_percentage(),
-            total_rate
+            total_rate,
+            p_.e_pass,
+            p_.nu_p
         });
+
+        // Prevent unbounded memory growth on indefinite/very long runs:
+        // once the cap is hit, halve the history by keeping every other
+        // row and double the sampling interval going forward. This keeps
+        // memory bounded while preserving the overall shape of the curve.
+        if (stats_history_.size() > kMaxStatsRows)
+        {
+            std::vector<StatsRow> compacted;
+            compacted.reserve(stats_history_.size() / 2 + 1);
+            for (size_t i = 0; i < stats_history_.size(); i += 2)
+                compacted.push_back(stats_history_[i]);
+            stats_history_.swap(compacted);
+            stats_interval_ *= 2;
+        }
     }
 
     Counts counts() const
@@ -1446,7 +1541,16 @@ private:
         std::string tag = tag_stream.str();
 
         if (p_.save_snapshots)
+        {
+            std::cout 
+                << "Saving final snapshot step="
+                << step_
+                << " time="
+                << time_
+                << std::endl;
+
             save_snapshot(tag);
+        }
         if (p_.save_npy)
             save_lattice_npy(tag);
         write_history_csv();
@@ -1470,6 +1574,23 @@ private:
     std::vector<double> event_rates_;
     FenwickTree ftree_;
     std::vector<Event> idx_to_event_;
+
+    // Reusable scratch buffers — avoids per-step heap allocation/free churn,
+    // which fragments the WASM heap over very long (unbounded) runs and
+    // eventually causes an allocation failure / crash.
+    std::vector<bool> refresh_visited_;
+    std::vector<std::pair<int, int>> refresh_targets_;
+    std::unordered_map<int, int> refresh_dist_;
+    std::vector<std::pair<int, int>> refresh_bfs_queue_;
+
+    std::vector<bool> relax_in_queue_;
+    std::vector<std::pair<int, int>> relax_queue_;
+    std::vector<std::pair<int, int>> relax_changed_;
+
+    std::vector<std::pair<int, int>> step_directly_changed_;
+    std::vector<std::pair<int, int>> step_all_changed_;
+
+    static constexpr size_t kMaxStatsRows = 5000;
 
     double time_ = 0.0;
     int step_ = 0;
@@ -1515,8 +1636,7 @@ extern "C"
         double nu_f,
         double nu_d,
         double nu_p,
-        double E_pass,
-        int material,
+        double e_pass,
         int seed)
     {
         wasm_params.Nx = Nx;
@@ -1529,8 +1649,7 @@ extern "C"
         wasm_params.nu_d = nu_d;
         // enable passivation
         wasm_params.nu_p = nu_p;
-        wasm_params.E_pass = E_pass;
-        wasm_params.material = material;
+        wasm_params.e_pass = e_pass;
         wasm_params.rng_seed = seed;
 
         wasm_params.pcg.seed((uint64_t)seed);
@@ -1543,7 +1662,7 @@ extern "C"
         double nu_f,
         double nu_d,
         double nu_p,
-        double E_pass
+        double e_pass
     )
     {
         if (!wasm_sim)
@@ -1555,7 +1674,7 @@ extern "C"
             nu_f,
             nu_d,
             nu_p,
-            E_pass
+            e_pass
         );
     }
 
@@ -1629,17 +1748,30 @@ extern "C"
         return wasm_sim ? wasm_sim->width() : 0;
     }
 
+    // Shared buffer so the frontend can query the EXACT byte length before
+    // reading WASM memory, instead of guessing a fixed max length (which
+    // can read past the end of the heap and throw an uncaught RangeError
+    // in JS -- crashing the whole WASM instance mid-call).
+    static std::string g_stats_json_buf;
+
     EMSCRIPTEN_KEEPALIVE
     const char *get_stats_json()
     {
-        static std::string json;
-
         if (!wasm_sim)
-            return "{}";
+        {
+            g_stats_json_buf = "{}";
+            return g_stats_json_buf.c_str();
+        }
 
-        json = wasm_sim->get_stats_json();
+        g_stats_json_buf = wasm_sim->get_stats_json();
 
-        return json.c_str();
+        return g_stats_json_buf.c_str();
+    }
+
+    EMSCRIPTEN_KEEPALIVE
+    int get_stats_json_len()
+    {
+        return (int)g_stats_json_buf.size();
     }
 
     EMSCRIPTEN_KEEPALIVE
@@ -1810,6 +1942,10 @@ int main(int argc, char *argv[])
         else if (arg == "--maxTime")
         {
             params.max_time = std::stod(argv[++i]);
+        }
+        else if (arg == "--snapshotEvery")
+        {
+            params.snapshot_every = std::stoi(argv[++i]);
         }
         else if (arg == "--seed")
         {
