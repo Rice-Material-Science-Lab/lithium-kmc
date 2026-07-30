@@ -210,6 +210,7 @@ struct KMCParams
     double nu_f = 5e7;
     double nu_d = 1e7;
     double nu_p = 1e6;
+    double e_pass = 0.4; // eV — passivation activation energy barrier
     double kB = 8.617333262145e-5; // eV / K
     int max_steps = 400000;
     double max_time = 100.0;
@@ -814,7 +815,12 @@ private:
             int coord = coordination_number(x0,y0);
             if (!exposed)
                 return 0.0;
-            return p_.nu_p * (empty_neighbors / 3.0);
+            // Apply the same Boltzmann suppression as hop/drop events so
+            // passivation competes fairly with growth instead of
+            // dominating regardless of temperature.
+            return p_.nu_p *
+                exp(-p_.e_pass / (p_.kB * p_.T)) *
+                (empty_neighbors / 3.0);
         }
         if (atype != FREE && atype != DEPOSITED)
             return 0.0;
@@ -1152,7 +1158,8 @@ public:
         double T,
         double nu_f,
         double nu_d,
-        double nu_p
+        double nu_p,
+        double e_pass
     )
     {
         p_.d0 = d0;
@@ -1160,6 +1167,7 @@ public:
         p_.nu_f = nu_f;
         p_.nu_d = nu_d;
         p_.nu_p = nu_p;
+        p_.e_pass = e_pass;
 
         // Important: old rates are now invalid
         parameters_changed_ = true;
@@ -1622,6 +1630,7 @@ extern "C"
         double nu_f,
         double nu_d,
         double nu_p,
+        double e_pass,
         int seed)
     {
         wasm_params.Nx = Nx;
@@ -1634,6 +1643,7 @@ extern "C"
         wasm_params.nu_d = nu_d;
         // enable passivation
         wasm_params.nu_p = nu_p;
+        wasm_params.e_pass = e_pass;
         wasm_params.rng_seed = seed;
 
         wasm_params.pcg.seed((uint64_t)seed);
@@ -1645,7 +1655,8 @@ extern "C"
         double T,
         double nu_f,
         double nu_d,
-        double nu_p
+        double nu_p,
+        double e_pass
     )
     {
         if (!wasm_sim)
@@ -1656,7 +1667,8 @@ extern "C"
             T,
             nu_f,
             nu_d,
-            nu_p
+            nu_p,
+            e_pass
         );
     }
 
