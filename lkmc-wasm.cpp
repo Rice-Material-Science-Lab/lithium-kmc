@@ -431,6 +431,8 @@ struct StatsRow
     int substrate;
     double fill;
     double total_rate;
+    double e_pass_used;   // debug: the e_pass value active at this step
+    double nu_p_used;     // debug: the nu_p value active at this step
 };
 
 // ---------------------------------------------------------------------------
@@ -1203,7 +1205,9 @@ public:
                 << "\"passivated\":" << s.passivated << ","
                 << "\"substrate\":" << s.substrate << ","
                 << "\"fill\":" << s.fill << ","
-                << "\"total_rate\":" << s.total_rate
+                << "\"total_rate\":" << s.total_rate << ","
+                << "\"e_pass_used\":" << s.e_pass_used << ","
+                << "\"nu_p_used\":" << s.nu_p_used
                 << "}";
 
             if(i + 1 < stats_history_.size())
@@ -1347,7 +1351,9 @@ private:
             passivated,
             substrate,
             fill_percentage(),
-            total_rate
+            total_rate,
+            p_.e_pass,
+            p_.nu_p
         });
 
         // Prevent unbounded memory growth on indefinite/very long runs:
