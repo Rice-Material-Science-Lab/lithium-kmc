@@ -206,8 +206,8 @@ struct KMCParams
     double d0 = 1000.0;
     double e0 = -0.28;
     double e1 = -0.50;
-    double nu_f = 5e9;
-    double nu_d = 1e5;
+    double nu_f = 5e7;
+    double nu_d = 1e7;
     double nu_p = 1e6;
     double kB = 8.617333262145e-5; // eV / K
     int max_steps = 400000;
@@ -220,7 +220,7 @@ struct KMCParams
     PCG64State pcg = {}; // default-constructed to seed=394583 values
     bool periodic_x = true;
     int log_every = 1000;
-    int snapshot_every = 10000;
+    int snapshot_every = 100;
     bool save_snapshots = true;
     bool save_npy = true;
     std::string output_dir = "kmc_output";
@@ -547,12 +547,32 @@ public:
             if (!execute_step())
                 break;
             if (step_ % p_.log_every == 0)
+            {
                 record_history("regular");
+
+                std::cout
+                    << "step=" << step_
+                    << " time=" << std::scientific << time_
+                    << " fill=" << fill_percentage()
+                    << "% rate=" << ftree_.total()
+                    << "\n";
+            }
 #ifndef __EMSCRIPTEN__
             if (p_.save_snapshots && step_ % p_.snapshot_every == 0)
             {
                 char tag[32];
                 snprintf(tag, sizeof(tag), "step_%07d", step_);
+
+                std::cout 
+                    << "Saving snapshot: "
+                    << tag
+                    << "  step="
+                    << step_
+                    << "  time="
+                    << std::scientific
+                    << time_
+                    << std::endl;
+
                 save_snapshot(tag);
             }
             if (p_.save_npy && step_ % p_.snapshot_every == 0)
@@ -732,10 +752,19 @@ private:
 
             int coord = coordination_number(x1, y1);
 
-            // Tip enhancement: low coordination = faster growth
-            double field_factor = 1.0 + 0.3 * (6 - coord);
+            double E_dep = 0.15 - 0.02 * coord;
 
-            return p_.d0 * field_factor;
+            if(E_dep < 0.02)
+                E_dep = 0.02;
+
+            double tip_factor = 1.0 + 0.05 * (6 - coord);
+
+            return p_.d0 *
+                tip_factor *
+                exp(
+                    -E_dep /
+                    (p_.kB * p_.T)
+                );
         }
 
         int x0 = ev.sx, y0 = ev.sy;
@@ -776,25 +805,58 @@ private:
         // Temporarily remove atom to compute destination energy.
         const_cast<ElectrodepositionKMC *>(this)->at(x0, y0) = EMPTY;
         double e_final = calc_local_energy(x1, y1, atype);
+        if(!std::isfinite(e_final) || !std::isfinite(e_init))
+        {
+            printf(
+                "BAD ENERGY init=%f final=%f\n",
+                e_init,
+                e_final
+            );
+            return 0.0;
+        }
         int coord_final = coordination_number(x1, y1);
         const_cast<ElectrodepositionKMC *>(this)->at(x0, y0) = atype;
 
         double barrier =
-        std::max(
-            0.0,
-            0.50 * (coord_initial - coord_final)
-        );
+            0.15 + 
+            0.03 * std::max(0, coord_initial - coord_final);
 
-        return
-        nu *
-        exp(-(e_final - e_init + barrier)
-        /
-        (p_.kB * p_.T));
+        double energy_penalty = std::max(0.0, e_final - e_init);
+
+        double rate =
+            nu *
+            exp(
+                -(barrier + energy_penalty)
+                /
+                (p_.kB * p_.T)
+            );
+
+        return rate;
     }
 
     void update_rate_at(int idx)
     {
         double new_rate = get_event_rate(idx_to_event_[idx]);
+
+        if(!std::isfinite(new_rate))
+        {
+            printf(
+                "INVALID RATE idx=%d rate=%e\n",
+                idx,
+                new_rate
+            );
+            new_rate = 0.0;
+        }
+
+        if(new_rate > 1e100)
+        {
+            printf(
+                "RATE TOO LARGE idx=%d rate=%e\n",
+                idx,
+                new_rate
+            );
+            new_rate = 1e100;
+        }
         double delta = new_rate - event_rates_[idx];
         if (std::abs(delta) > 1.0e-18)
         {
@@ -945,8 +1007,47 @@ public:
             parameters_changed_ = false;
         }
         double r_tot = ftree_.total();
+        if(step_ % 100 == 0)
+        {
+            printf(
+                "STEP %d RATE %.6e TIME %.6e FILL %.3f%%\n",
+                step_,
+                r_tot,
+                time_,
+                fill_percentage()
+            );
+        }
+
         if (r_tot <= 0.0)
+        {
+            std::cerr 
+                << "\nKMC STOP: total event rate reached zero\n"
+                << "step=" << step_
+                << " time=" << time_
+                << "\n";
+
+            int empty = 0;
+            int free = 0;
+            int deposited = 0;
+            int passivated = 0;
+
+            for (auto v : lattice_)
+            {
+                if (v == EMPTY) empty++;
+                else if (v == FREE) free++;
+                else if (v == DEPOSITED) deposited++;
+                else if (v == PASSIVATED) passivated++;
+            }
+
+            std::cerr
+                << "EMPTY=" << empty
+                << " FREE=" << free
+                << " DEPOSITED=" << deposited
+                << " PASSIVATED=" << passivated
+                << "\n";
+
             return false;
+        }
 
         // Time increment.
         double u1 = std::max(rng_.next_double(), 1.0e-15);
@@ -991,7 +1092,8 @@ public:
             }
         }
 
-        std::vector<std::pair<int, int>> relaxed;
+        std::vector<std::pair<int,int>> relaxed =
+            update_bonding_relaxation(directly_changed);
 
         // Merge changed sets.
         std::vector<std::pair<int, int>> all_changed = directly_changed;
@@ -1371,7 +1473,16 @@ private:
         std::string tag = tag_stream.str();
 
         if (p_.save_snapshots)
+        {
+            std::cout 
+                << "Saving final snapshot step="
+                << step_
+                << " time="
+                << time_
+                << std::endl;
+
             save_snapshot(tag);
+        }
         if (p_.save_npy)
             save_lattice_npy(tag);
         write_history_csv();
@@ -1729,6 +1840,10 @@ int main(int argc, char *argv[])
         else if (arg == "--maxTime")
         {
             params.max_time = std::stod(argv[++i]);
+        }
+        else if (arg == "--snapshotEvery")
+        {
+            params.snapshot_every = std::stoi(argv[++i]);
         }
         else if (arg == "--seed")
         {
