@@ -394,7 +394,11 @@ public:
             }
             bit >>= 1;
         }
-        return idx; // 0-based
+        // Clamp: idx here is 0-based "last index whose prefix < target",
+        // so the returned event index is idx, but it must never reach size_.
+        if (idx >= size_)
+            idx = size_ - 1;
+        return idx;
     }
 
 private:
@@ -853,21 +857,25 @@ private:
 
         if(!std::isfinite(new_rate))
         {
+#ifndef __EMSCRIPTEN__
             printf(
                 "INVALID RATE idx=%d rate=%e\n",
                 idx,
                 new_rate
             );
+#endif
             new_rate = 0.0;
         }
 
         if(new_rate > 1e100)
         {
+#ifndef __EMSCRIPTEN__
             printf(
                 "RATE TOO LARGE idx=%d rate=%e\n",
                 idx,
                 new_rate
             );
+#endif
             new_rate = 1e100;
         }
         double delta = new_rate - event_rates_[idx];
@@ -1020,6 +1028,7 @@ public:
             parameters_changed_ = false;
         }
         double r_tot = ftree_.total();
+#ifndef __EMSCRIPTEN__
         if(step_ % 100 == 0)
         {
             printf(
@@ -1030,6 +1039,7 @@ public:
                 fill_percentage()
             );
         }
+#endif
 
         if (r_tot <= 0.0)
         {
@@ -1070,6 +1080,8 @@ public:
         double u2 = std::max(rng_.next_double(), 1.0e-15);
         double target = u2 * r_tot;
         int idx = ftree_.find_prefix_index(target);
+        if (idx < 0) idx = 0;
+        if (idx >= max_events_) idx = max_events_ - 1;
 
         const Event &ev = idx_to_event_[idx];
         std::vector<std::pair<int, int>> directly_changed;
@@ -1083,9 +1095,8 @@ public:
         else
         {
             int x0 = ev.sx, y0 = ev.sy;
-            int x1 = wrap_x(ev.dx), y1 = ev.dy;
-            // passivation
-            if (ev.dx == 0 && ev.dy == 0)
+
+            if (ev.is_passivation)
             {
                 if (at(x0, y0) == DEPOSITED)
                 {
@@ -1097,6 +1108,13 @@ public:
             {
                 int x1 = wrap_x(ev.dx);
                 int y1 = ev.dy;
+
+                if (x1 == -1 || y1 < 0 || y1 >= p_.Ny)
+                {
+                    // Stale/invalid event (rate table out of sync) — skip safely.
+                    return true;
+                }
+
                 int8_t atype = at(x0, y0);
                 at(x0, y0) = EMPTY;
                 at(x1, y1) = atype;
