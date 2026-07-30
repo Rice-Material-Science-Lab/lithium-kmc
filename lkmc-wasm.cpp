@@ -4,7 +4,7 @@
  * WASM version of C++ port of LKMC_v2_commented_b.py.
  *
  *  * Build:
- * emcc lkmc-wasm.cpp -o public/lkmc-wasm.js -O3 -fexceptions -sEXPORT_ES6 -sMODULARIZE -sEXPORTED_FUNCTIONS="['_set_params','_update_simulation_params','_init_simulation','_run_steps','_play','_pause','_stop','_step_once','_playback_tick','_set_batch_size','_set_stats_interval','_get_playback_state','_get_lattice_data','_get_lattice','_get_lattice_size','_get_width','_get_height','_get_step','_get_wall_time','_get_time','_get_fill','_get_stats_json','_get_passivated','_cleanup_simulation','_force_update_frontend']" -sEXPORTED_RUNTIME_METHODS="['ccall','cwrap','HEAP8','wasmMemory']"
+ * emcc lkmc-wasm.cpp -o public/lkmc-wasm.js -O3 -fexceptions -sALLOW_MEMORY_GROWTH=1 -sEXPORT_ES6 -sMODULARIZE -sEXPORTED_FUNCTIONS="['_set_params','_update_simulation_params','_init_simulation','_run_steps','_play','_pause','_stop','_step_once','_playback_tick','_set_batch_size','_set_stats_interval','_get_playback_state','_get_lattice_data','_get_lattice','_get_lattice_size','_get_width','_get_height','_get_step','_get_wall_time','_get_time','_get_fill','_get_stats_json','_get_passivated','_cleanup_simulation','_force_update_frontend']" -sEXPORTED_RUNTIME_METHODS="['ccall','cwrap','HEAP8','wasmMemory']"
  * Exported WASM stuff:
  *   _set_params(int Nx, int Ny, double d0, double T, double e0, double e1, double nu_f, double nu_d, int seed)
  *   _update_simulation_params(double d0, double T, double nu_f, double nu_d, double nu_p)
@@ -505,6 +505,17 @@ public:
         if (p_.save_snapshots)
             fs::create_directories(out_dir_ / "snapshots");
 #endif
+        // Pre-size reusable scratch buffers once, up front, so steady-state
+        // simulation never triggers a vector/map reallocation.
+        refresh_visited_.assign((size_t)p_.Nx * p_.Ny, false);
+        relax_in_queue_.assign((size_t)p_.Nx * p_.Ny, false);
+        refresh_targets_.reserve(64);
+        refresh_bfs_queue_.reserve(64);
+        relax_queue_.reserve(64);
+        relax_changed_.reserve(64);
+        step_directly_changed_.reserve(4);
+        step_all_changed_.reserve(64);
+
         // Build event index table.
         setup_indices();
 
@@ -899,45 +910,44 @@ private:
     // -----------------------------------------------------------------------
     void refresh_local_rates(const std::vector<std::pair<int, int>> &changed)
     {
-        // Collect unique sites within hex distance 2.
-        std::vector<std::pair<int, int>> targets;
-        targets.reserve(changed.size() * 13); // ~13 sites per seed
-
-        // Simple dedup via a flat visited set backed by the lattice index.
-        std::vector<bool> visited(p_.Nx * p_.Ny, false);
-
-        std::queue<std::pair<int, int>> q;
-        std::unordered_map<int, int> dist;
+        // Reuse member scratch buffers instead of allocating fresh
+        // containers every step (prevents WASM heap fragmentation on
+        // very long runs).
+        refresh_targets_.clear();
+        std::fill(refresh_visited_.begin(), refresh_visited_.end(), false);
+        refresh_dist_.clear();
+        refresh_bfs_queue_.clear();
 
         for (auto [sx, sy] : changed)
         {
-            q.push({sx, sy});
-            dist[sy * p_.Nx + sx] = 0;
+            refresh_bfs_queue_.emplace_back(sx, sy);
+            refresh_dist_[sy * p_.Nx + sx] = 0;
         }
-        while (!q.empty())
+
+        size_t head = 0;
+        while (head < refresh_bfs_queue_.size())
         {
-            auto [x, y] = q.front();
-            q.pop();
-            int d = dist[y * p_.Nx + x];
+            auto [x, y] = refresh_bfs_queue_[head++];
+            int d = refresh_dist_[y * p_.Nx + x];
             int linear = y * p_.Nx + x;
-            if (!visited[linear])
+            if (!refresh_visited_[linear])
             {
-                visited[linear] = true;
-                targets.emplace_back(x, y);
+                refresh_visited_[linear] = true;
+                refresh_targets_.emplace_back(x, y);
             }
             if (d == 2)
                 continue;
             for_each_neighbour(x, y, [&](int nx, int ny)
                                {
                     int key = ny * p_.Nx + nx;
-                    if (!dist.count(key)) {
-                        dist[key] = d + 1;
-                        q.push({nx, ny});
+                    if (!refresh_dist_.count(key)) {
+                        refresh_dist_[key] = d + 1;
+                        refresh_bfs_queue_.emplace_back(nx, ny);
                     } });
         }
 
         int top_y = p_.Ny - 1;
-        for (auto [x, y] : targets)
+        for (auto [x, y] : refresh_targets_)
         {
             if (y == top_y)
                 update_rate_at(drop_index(x));
@@ -947,9 +957,8 @@ private:
         }
     }
 
-    // -----------------------------------------------------------------------
-    // Bonding-state relaxation (mirrors update_bonding_relaxation)
-    // -----------------------------------------------------------------------
+    // Writes results into member relax_changed_ instead of returning by
+    // value, so no vector is allocated/copied on every step.
     int8_t desired_bond_state(int x, int y) const
     {
         int8_t st = at(x, y);
@@ -965,22 +974,21 @@ private:
         return bonded ? DEPOSITED : FREE;
     }
 
-    std::vector<std::pair<int, int>> update_bonding_relaxation(
+    void update_bonding_relaxation(
         const std::vector<std::pair<int, int>> &seeds)
     {
-        // BFS queue.
-        std::vector<std::pair<int, int>> queue;
-        std::vector<bool> in_queue(p_.Nx * p_.Ny, false);
-        std::vector<std::pair<int, int>> changed;
+        relax_queue_.clear();
+        std::fill(relax_in_queue_.begin(), relax_in_queue_.end(), false);
+        relax_changed_.clear();
 
         // Seed with each site and its direct neighbours.
         auto enqueue = [&](int x, int y)
         {
             int lin = y * p_.Nx + x;
-            if (!in_queue[lin])
+            if (!relax_in_queue_[lin])
             {
-                in_queue[lin] = true;
-                queue.emplace_back(x, y);
+                relax_in_queue_[lin] = true;
+                relax_queue_.emplace_back(x, y);
             }
         };
         for (auto [sx, sy] : seeds)
@@ -991,11 +999,11 @@ private:
         }
 
         size_t head = 0;
-        while (head < queue.size())
+        while (head < relax_queue_.size())
         {
-            auto [x, y] = queue[head++];
+            auto [x, y] = relax_queue_[head++];
             int lin = y * p_.Nx + x;
-            in_queue[lin] = false; // allow re-enqueue if needed
+            relax_in_queue_[lin] = false; // allow re-enqueue if needed
 
             int8_t cur = at(x, y);
             if (cur != FREE && cur != DEPOSITED)
@@ -1006,14 +1014,13 @@ private:
                 continue;
 
             at(x, y) = desired;
-            changed.emplace_back(x, y);
+            relax_changed_.emplace_back(x, y);
 
             // Re-enqueue neighbours and self.
             for_each_neighbour(x, y, [&](int nx, int ny)
                                { enqueue(nx, ny); });
             enqueue(x, y);
         }
-        return changed;
     }
 
 public:
@@ -1084,13 +1091,13 @@ public:
         if (idx >= max_events_) idx = max_events_ - 1;
 
         const Event &ev = idx_to_event_[idx];
-        std::vector<std::pair<int, int>> directly_changed;
+        step_directly_changed_.clear();
 
         if (ev.is_drop)
         {
             int x1 = ev.dx, y1 = ev.dy;
             at(x1, y1) = FREE;
-            directly_changed.emplace_back(x1, y1);
+            step_directly_changed_.emplace_back(x1, y1);
         }
         else
         {
@@ -1101,7 +1108,7 @@ public:
                 if (at(x0, y0) == DEPOSITED)
                 {
                     at(x0, y0) = PASSIVATED;
-                    directly_changed.emplace_back(x0, y0);
+                    step_directly_changed_.emplace_back(x0, y0);
                 }
             }
             else
@@ -1118,18 +1125,20 @@ public:
                 int8_t atype = at(x0, y0);
                 at(x0, y0) = EMPTY;
                 at(x1, y1) = atype;
-                directly_changed.emplace_back(x0, y0);
-                directly_changed.emplace_back(x1, y1);
+                step_directly_changed_.emplace_back(x0, y0);
+                step_directly_changed_.emplace_back(x1, y1);
             }
         }
 
-        std::vector<std::pair<int,int>> relaxed =
-            update_bonding_relaxation(directly_changed);
+        update_bonding_relaxation(step_directly_changed_); // fills relax_changed_
 
-        // Merge changed sets.
-        std::vector<std::pair<int, int>> all_changed = directly_changed;
-        all_changed.insert(all_changed.end(), relaxed.begin(), relaxed.end());
-        refresh_local_rates(all_changed);
+        // Merge changed sets (reused buffer, no fresh allocation).
+        step_all_changed_.clear();
+        step_all_changed_.insert(step_all_changed_.end(),
+                                  step_directly_changed_.begin(), step_directly_changed_.end());
+        step_all_changed_.insert(step_all_changed_.end(),
+                                  relax_changed_.begin(), relax_changed_.end());
+        refresh_local_rates(step_all_changed_);
         time_ += dt;
         ++step_;
         if(step_ % stats_interval_ == 0)
@@ -1332,6 +1341,20 @@ private:
             fill_percentage(),
             total_rate
         });
+
+        // Prevent unbounded memory growth on indefinite/very long runs:
+        // once the cap is hit, halve the history by keeping every other
+        // row and double the sampling interval going forward. This keeps
+        // memory bounded while preserving the overall shape of the curve.
+        if (stats_history_.size() > kMaxStatsRows)
+        {
+            std::vector<StatsRow> compacted;
+            compacted.reserve(stats_history_.size() / 2 + 1);
+            for (size_t i = 0; i < stats_history_.size(); i += 2)
+                compacted.push_back(stats_history_[i]);
+            stats_history_.swap(compacted);
+            stats_interval_ *= 2;
+        }
     }
 
     Counts counts() const
@@ -1537,6 +1560,23 @@ private:
     std::vector<double> event_rates_;
     FenwickTree ftree_;
     std::vector<Event> idx_to_event_;
+
+    // Reusable scratch buffers — avoids per-step heap allocation/free churn,
+    // which fragments the WASM heap over very long (unbounded) runs and
+    // eventually causes an allocation failure / crash.
+    std::vector<bool> refresh_visited_;
+    std::vector<std::pair<int, int>> refresh_targets_;
+    std::unordered_map<int, int> refresh_dist_;
+    std::vector<std::pair<int, int>> refresh_bfs_queue_;
+
+    std::vector<bool> relax_in_queue_;
+    std::vector<std::pair<int, int>> relax_queue_;
+    std::vector<std::pair<int, int>> relax_changed_;
+
+    std::vector<std::pair<int, int>> step_directly_changed_;
+    std::vector<std::pair<int, int>> step_all_changed_;
+
+    static constexpr size_t kMaxStatsRows = 5000;
 
     double time_ = 0.0;
     int step_ = 0;
