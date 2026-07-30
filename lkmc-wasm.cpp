@@ -207,8 +207,8 @@ struct KMCParams
     double e0 = -0.28;
     double e1 = -0.50;
     double nu_f = 5e9;
-    double nu_d = 5e9;
-    double nu_p = 2e8;
+    double nu_d = 1e5;
+    double nu_p = 1e6;
     double kB = 8.617333262145e-5; // eV / K
     int max_steps = 400000;
     double max_time = 100.0;
@@ -724,13 +724,18 @@ private:
     {
         if (ev.is_drop)
         {
-            int x1 = ev.dx, y1 = ev.dy;
+            int x1 = ev.dx;
+            int y1 = ev.dy;
+
             if (at(x1, y1) != EMPTY)
                 return 0.0;
 
-            int coord = coordination_number(x1,y1);
-            double alpha = 0.5;
-            return p_.d0 * exp(-alpha * coord);
+            int coord = coordination_number(x1, y1);
+
+            // Tip enhancement: low coordination = faster growth
+            double field_factor = 1.0 + 0.3 * (6 - coord);
+
+            return p_.d0 * field_factor;
         }
 
         int x0 = ev.sx, y0 = ev.sy;
@@ -752,7 +757,7 @@ private:
             int coord = coordination_number(x0,y0);
             if (!exposed)
                 return 0.0;
-            return p_.nu_p * (empty_neighbors / 6.0);
+            return p_.nu_p * (empty_neighbors / 3.0);
         }
         if (atype != FREE && atype != DEPOSITED)
             return 0.0;
@@ -777,7 +782,7 @@ private:
         double barrier =
         std::max(
             0.0,
-            0.10 * (coord_initial - coord_final)
+            0.50 * (coord_initial - coord_final)
         );
 
         return
@@ -986,7 +991,7 @@ public:
             }
         }
 
-        auto relaxed = update_bonding_relaxation(directly_changed);
+        std::vector<std::pair<int, int>> relaxed;
 
         // Merge changed sets.
         std::vector<std::pair<int, int>> all_changed = directly_changed;
