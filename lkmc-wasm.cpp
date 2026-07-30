@@ -88,7 +88,8 @@ namespace fs = std::filesystem;
 #endif
 
 // ---------------------------------------------------------------------------
-// PCG64 — identical to numpy.random.default_rng() draw sequence.
+// PCG64 compatible output generator.
+// Exact NumPy PCG64 reproduction requires importing the state/inc values.
 //
 // numpy uses PCG64 with a 128-bit LCG and XSL-RR output function.
 // This class reproduces exactly the same sequence when initialized with
@@ -480,7 +481,7 @@ public:
         energy_lookup_[DEPOSITED][DEPOSITED] = p_.e0;
         energy_lookup_[FREE][SUBSTRATE] = p_.e1;
         energy_lookup_[SUBSTRATE][FREE] = p_.e1;
-        energy_lookup_[DEPOSITED][SUBSTRATE] = p_   .e1;
+        energy_lookup_[DEPOSITED][SUBSTRATE] = p_.e1;
         energy_lookup_[SUBSTRATE][DEPOSITED] = p_.e1;
         energy_lookup_[SUBSTRATE][SUBSTRATE] = p_.e1;
         // PASSIVATED interacts exactly like DEPOSITED
@@ -757,10 +758,7 @@ private:
             if(E_dep < 0.02)
                 E_dep = 0.02;
 
-            double tip_factor = 1.0 + 0.05 * (6 - coord);
-
             return p_.d0 *
-                tip_factor *
                 exp(
                     -E_dep /
                     (p_.kB * p_.T)
