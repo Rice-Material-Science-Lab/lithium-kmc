@@ -407,9 +407,10 @@ private:
 // ---------------------------------------------------------------------------
 struct Event
 {
-    bool is_drop;   // true => drop event; false => hop event
-    int16_t sx, sy; // source site  (valid only for hops)
-    int16_t dx, dy; // destination site raw (before x-wrap)
+    bool is_drop;
+    bool is_passivation;
+    int16_t sx, sy;
+    int16_t dx, dy;
 };
 
 // for stats stuff
@@ -657,7 +658,15 @@ private:
         // Drop events: indices [0, Nx)
         for (int x = 0; x < p_.Nx; ++x)
         {
-            idx_to_event_[x] = {true, 0, 0, (int16_t)x, (int16_t)top_y};
+            idx_to_event_[x] =
+            {
+                true,
+                false,
+                0,
+                0,
+                (int16_t)x,
+                (int16_t)top_y
+            };
         }
         int base = num_drop_;
         for (int y = 0; y < p_.Ny; ++y)
@@ -672,21 +681,27 @@ private:
                     const int *DX = (y & 1) ? ODD_DX : EVEN_DX;
                     const int *DY = (y & 1) ? ODD_DY : EVEN_DY;
 
-                    idx_to_event_[idx] = {
+                    idx_to_event_[idx] =
+                    {
+                        false,
                         false,
                         (int16_t)x,
                         (int16_t)y,
                         (int16_t)(x + DX[d]),
-                        (int16_t)(y + DY[d])};
+                        (int16_t)(y + DY[d])
+                    };
                 }
 
                 // passivation event
-                idx_to_event_[base + site_off + 6] = {
+                idx_to_event_[base + site_off + 6] =
+                {
                     false,
+                    true,
                     (int16_t)x,
                     (int16_t)y,
                     0,
-                    0};
+                    0
+                };
             }
         }
     }
@@ -768,7 +783,7 @@ private:
         int x0 = ev.sx, y0 = ev.sy;
         int8_t atype = at(x0, y0);
         // passivation event
-        if (ev.dx == 0 && ev.dy == 0)
+        if(ev.is_passivation)
         {
             if (atype != DEPOSITED)
                 return 0.0;
@@ -801,15 +816,15 @@ private:
         int coord_initial = coordination_number(x0, y0);
 
         // Temporarily remove atom to compute destination energy.
-        const_cast<ElectrodepositionKMC *>(this)->at(x0, y0) = EMPTY;
-        double e_final = calc_local_energy(x1, y1, atype);
+        int8_t old = const_cast<ElectrodepositionKMC *>(this)->at(x0,y0);
+
+        const_cast<ElectrodepositionKMC *>(this)->at(x0,y0) = EMPTY;
+
+        double e_final = calc_local_energy(x1,y1,atype);
+        const_cast<ElectrodepositionKMC *>(this)->at(x0,y0) = old;
         if(!std::isfinite(e_final) || !std::isfinite(e_init))
         {
-            printf(
-                "BAD ENERGY init=%f final=%f\n",
-                e_init,
-                e_final
-            );
+            const_cast<ElectrodepositionKMC *>(this)->at(x0,y0)=old;
             return 0.0;
         }
         int coord_final = coordination_number(x1, y1);
