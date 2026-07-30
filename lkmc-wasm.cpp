@@ -7,7 +7,7 @@
  * emcc lkmc-wasm.cpp -o public/lkmc-wasm.js -O3 -fexceptions -sEXPORT_ES6 -sMODULARIZE -sEXPORTED_FUNCTIONS="['_set_params','_update_simulation_params','_init_simulation','_run_steps','_play','_pause','_stop','_step_once','_playback_tick','_set_batch_size','_set_stats_interval','_get_playback_state','_get_lattice_data','_get_lattice','_get_lattice_size','_get_width','_get_height','_get_step','_get_wall_time','_get_time','_get_fill','_get_stats_json','_get_passivated','_cleanup_simulation','_force_update_frontend']" -sEXPORTED_RUNTIME_METHODS="['ccall','cwrap','HEAP8','wasmMemory']"
  * Exported WASM stuff:
  *   _set_params(int Nx, int Ny, double d0, double T, double e0, double e1, double nu_f, double nu_d, int seed)
- *   _update_simulation_params(double d0, double T, double nu_f, double nu_d, double nu_p, double E_pass)
+ *   _update_simulation_params(double d0, double T, double nu_f, double nu_d, double nu_p)
  *   _init_simulation()
  *   _run_steps(int steps)
  *   _get_lattice_data()
@@ -35,7 +35,6 @@
  *   nu_f        = 5e9
  *   nu_d        = 1e9
  *   nu_p        = 1e6
- *   E_pass      = 0.25
  *   max_steps   = 400000
  *   max_time    = 100.0
  *   rng_seed    = 394583
@@ -203,7 +202,6 @@ struct KMCParams
 {
     int Nx = 100;
     int Ny = 100;
-    int material = 3; // Default material: 3 (Lithium)
     double T = 300.0;
     double d0 = 1000.0;
     double e0 = -0.28;
@@ -211,7 +209,6 @@ struct KMCParams
     double nu_f = 5e9;
     double nu_d = 5e9;
     double nu_p = 2e8;
-    double E_pass = 0.40;          // passivation activation barrier (eV)
     double kB = 8.617333262145e-5; // eV / K
     int max_steps = 400000;
     double max_time = 100.0;
@@ -296,8 +293,6 @@ KMCParams load_config(const std::string &path, KMCParams p = {})
             p.Nx = toInt(val, p.Nx);
         else if (key == "Ny")
             p.Ny = toInt(val, p.Ny);
-        else if (key == "material")
-            p.material = toInt(val, p.material);
         else if (key == "T")
             p.T = toDouble(val, p.T);
         else if (key == "d0")
@@ -312,8 +307,6 @@ KMCParams load_config(const std::string &path, KMCParams p = {})
             p.nu_d = toDouble(val, p.nu_d);
         else if (key == "nu_p")
             p.nu_p = toDouble(val, p.nu_p);
-        else if (key == "E_pass")
-            p.E_pass = toDouble(val, p.E_pass);
         else if (key == "max_steps")
             p.max_steps = toInt(val, p.max_steps);
         else if (key == "max_time")
@@ -446,74 +439,7 @@ struct HistoryRow
     int n_total;
     double total_rate;
 };
-struct MaterialProperties
-{
-    double e0;
-    double e1;
-    double nu_f;
-    double nu_d;
-    double E_pass;
-    // Additional material properties (not currently used in the simulation)
-    double surface_energy;        // J/m²
-    double activation_diffusion;  // eV
-    double activation_attach;     // eV
-    double activation_detach;     // eV
-    double lattice_constant;      // nm
-    double atomic_volume;         // m³
-    double exchange_current;      // A/m²
-    double transfer_coeff;        // Butler-Volmer α
-    int crystal_type;             // FCC/BCC/HCP
-};
 
-// None of the params are set for sure rn
-MaterialProperties get_material(int id)
-{
-    switch(id)
-    {
-        // Lithium (Li) - Default Material with exact UI default parameters
-        case 3:
-            return {
-                -0.28,   // atom-atom bonding (eV)
-                -0.50,   // substrate bonding (eV)
-                5e9,     // fast hopping / surface diffusion rate (s^-1)
-                5e9,     // detachment rate (s^-1)
-                0.40     // passivation activation barrier (eV)
-            };
-
-        // Copper
-        case 0:
-            return {
-                -0.08,   // atom-atom bonding
-                -0.25,   // substrate bonding
-                1e10,    // deposition
-                5e10,    // diffusion
-                0.15     // passivation
-            };
-
-        // Silver
-        case 1:
-            return {
-                -0.05,
-                -0.20,
-                8e9,
-                3e10,
-                0.10
-            };
-
-        // Nickel
-        case 2:
-            return {
-                -0.15,
-                -0.35,
-                2e10,
-                8e10,
-                0.25
-            };
-
-        default:
-            return get_material(3);
-    }
-}
 // ---------------------------------------------------------------------------
 // Main simulator class (mirrors ElectrodepositionKMC)
 // ---------------------------------------------------------------------------
@@ -532,13 +458,6 @@ public:
           ftree_(p.Nx + p.Nx * p.Ny * 7),
           idx_to_event_(p.Nx + p.Nx * p.Ny * 7)
     {
-        auto mat = get_material(p_.material);
-
-        p_.e0 = mat.e0;
-        p_.e1 = mat.e1;
-        p_.nu_f = mat.nu_f;
-        p_.nu_d = mat.nu_d;
-        p_.E_pass = mat.E_pass;
         // Validate.
         if (p_.Nx < 1)
             throw std::invalid_argument("Nx must be >= 1.");
@@ -561,9 +480,17 @@ public:
         energy_lookup_[DEPOSITED][DEPOSITED] = p_.e0;
         energy_lookup_[FREE][SUBSTRATE] = p_.e1;
         energy_lookup_[SUBSTRATE][FREE] = p_.e1;
-        energy_lookup_[DEPOSITED][SUBSTRATE] = p_.e1;
+        energy_lookup_[DEPOSITED][SUBSTRATE] = p_   .e1;
         energy_lookup_[SUBSTRATE][DEPOSITED] = p_.e1;
         energy_lookup_[SUBSTRATE][SUBSTRATE] = p_.e1;
+        // PASSIVATED interacts exactly like DEPOSITED
+        energy_lookup_[FREE][PASSIVATED] = p_.e0;
+        energy_lookup_[PASSIVATED][FREE] = p_.e0;
+        energy_lookup_[DEPOSITED][PASSIVATED] = p_.e0;
+        energy_lookup_[PASSIVATED][DEPOSITED] = p_.e0;
+        energy_lookup_[PASSIVATED][PASSIVATED] = p_.e0;
+        energy_lookup_[PASSIVATED][SUBSTRATE] = p_.e1;
+        energy_lookup_[SUBSTRATE][PASSIVATED] = p_.e1;
 
 // Prepare output directory.
 #ifndef __EMSCRIPTEN__
@@ -768,8 +695,6 @@ private:
             e += energy_lookup_[atom_type][n];
         });
 
-        e += bond_energy(coord);
-
         return e;
     }
 
@@ -804,9 +729,7 @@ private:
                 return 0.0;
 
             int coord = coordination_number(x1,y1);
-            return
-            p_.d0 *
-            (1.0 + 0.35 * coord);
+            return p_.d0;
         }
 
         int x0 = ev.sx, y0 = ev.sy;
@@ -814,7 +737,7 @@ private:
         // passivation event
         if (ev.dx == 0 && ev.dy == 0)
         {
-            if (atype != DEPOSITED && atype != FREE)
+            if (atype != DEPOSITED)
                 return 0.0;
             // Passivation only occurs on exposed deposited atoms
             bool exposed = false;
@@ -828,15 +751,7 @@ private:
             int coord = coordination_number(x0,y0);
             if (!exposed)
                 return 0.0;
-            double barrier =
-            p_.E_pass
-            +0.02*coord
-            -0.03*empty_neighbors;
-            // More exposed surface atoms passivate faster
-            double surface_factor = 1.0 + 0.25 * empty_neighbors;
-            return p_.nu_p *
-                   surface_factor *
-                   std::exp(-barrier / (p_.kB * p_.T));
+            return p_.nu_p * (empty_neighbors / 6.0);
         }
         if (atype != FREE && atype != DEPOSITED)
             return 0.0;
@@ -859,14 +774,16 @@ private:
         const_cast<ElectrodepositionKMC *>(this)->at(x0, y0) = atype;
 
         double barrier =
-        0.03 *
-        (coord_initial - coord_final);
+        std::max(
+            0.0,
+            0.10 * (coord_initial - coord_final)
+        );
 
         return
         nu *
-        exp(-(e_final-e_init + barrier)
+        exp(-(e_final - e_init + barrier)
         /
-        (2.0 * p_.kB * p_.T));
+        (p_.kB * p_.T));
     }
 
     void update_rate_at(int idx)
@@ -1087,8 +1004,7 @@ public:
         double T,
         double nu_f,
         double nu_d,
-        double nu_p,
-        double E_pass
+        double nu_p
     )
     {
         p_.d0 = d0;
@@ -1096,7 +1012,6 @@ public:
         p_.nu_f = nu_f;
         p_.nu_d = nu_d;
         p_.nu_p = nu_p;
-        p_.E_pass = E_pass;
 
         // Important: old rates are now invalid
         parameters_changed_ = true;
@@ -1149,7 +1064,11 @@ public:
 
         for (auto v : lattice_)
         {
-            if (v == FREE || v == DEPOSITED)
+            if (
+                v == FREE ||
+                v == DEPOSITED ||
+                v == PASSIVATED
+            )
                 deposited++;
         }
 
@@ -1515,8 +1434,6 @@ extern "C"
         double nu_f,
         double nu_d,
         double nu_p,
-        double E_pass,
-        int material,
         int seed)
     {
         wasm_params.Nx = Nx;
@@ -1529,8 +1446,6 @@ extern "C"
         wasm_params.nu_d = nu_d;
         // enable passivation
         wasm_params.nu_p = nu_p;
-        wasm_params.E_pass = E_pass;
-        wasm_params.material = material;
         wasm_params.rng_seed = seed;
 
         wasm_params.pcg.seed((uint64_t)seed);
@@ -1542,8 +1457,7 @@ extern "C"
         double T,
         double nu_f,
         double nu_d,
-        double nu_p,
-        double E_pass
+        double nu_p
     )
     {
         if (!wasm_sim)
@@ -1554,8 +1468,7 @@ extern "C"
             T,
             nu_f,
             nu_d,
-            nu_p,
-            E_pass
+            nu_p
         );
     }
 
