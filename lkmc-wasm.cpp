@@ -729,7 +729,8 @@ private:
                 return 0.0;
 
             int coord = coordination_number(x1,y1);
-            return p_.d0;
+            double alpha = 0.5;
+            return p_.d0 * exp(-alpha * coord);
         }
 
         int x0 = ev.sx, y0 = ev.sy;
