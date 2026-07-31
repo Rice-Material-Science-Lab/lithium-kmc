@@ -4,7 +4,7 @@
  * WASM version of C++ port of LKMC_v2_commented_b.py.
  *
  *  * Build:
- * emcc lkmc-wasm.cpp -o public/lkmc-wasm.js -O3 -fexceptions -sINITIAL_MEMORY=268435456 -sEXPORT_ES6 -sMODULARIZE -sEXPORTED_FUNCTIONS="['_set_params','_update_simulation_params','_init_simulation','_run_steps','_play','_pause','_stop','_step_once','_playback_tick','_set_batch_size','_set_stats_interval','_get_stats_interval','_get_playback_state','_get_lattice_data','_get_lattice','_get_lattice_size','_get_width','_get_height','_get_step','_get_wall_time','_get_time','_get_fill','_get_stats_json','_get_stats_json_len','_get_passivated','_cleanup_simulation','_force_update_frontend']" -sEXPORTED_RUNTIME_METHODS="['ccall','cwrap','HEAP8','wasmMemory']"
+ * emcc lkmc-wasm.cpp -o public/lkmc-wasm.js -O3 -fexceptions -sINITIAL_MEMORY=268435456 -sEXPORT_ES6 -sMODULARIZE -sEXPORTED_FUNCTIONS="['_set_params','_update_simulation_params','_init_simulation','_run_steps','_play','_pause','_stop','_step_once','_playback_tick','_set_batch_size','_set_stats_interval','_get_stats_interval','_get_playback_state','_mark_carbon','_finalize_carbon_placement', '_get_lattice_data','_get_lattice','_get_lattice_size','_get_width','_get_height','_get_step','_get_wall_time','_get_time','_get_fill','_get_stats_json','_get_stats_json_len','_get_passivated','_cleanup_simulation','_force_update_frontend']" -sEXPORTED_RUNTIME_METHODS="['ccall','cwrap','HEAP8','wasmMemory']"
  * Exported WASM stuff:
  *   _set_params(int Nx, int Ny, double d0, double T, double e0, double e1, double nu_f, double nu_d, int seed) 
  *   _update_simulation_params(double d0, double T, double nu_f, double nu_d, double nu_p)
@@ -175,6 +175,7 @@ constexpr int8_t FREE = 1;
 constexpr int8_t DEPOSITED = 2;
 constexpr int8_t SUBSTRATE = 3;
 constexpr int8_t PASSIVATED = 4;
+constexpr int8_t CARBON = 5; // graphite anode site -- rigid, permanent, like SUBSTRATE
 // ---------------------------------------------------------------------------
 // Hexagonal lattice neighbour offsets (odd-r horizontal layout)
 // ---------------------------------------------------------------------------
@@ -207,6 +208,7 @@ struct KMCParams
     double d0 = 1000.0;
     double e0 = -0.28;
     double e1 = -0.50;
+    double e_c = -0.6; // eV -- Li-C bond energy for graphite anode sites
     double nu_f = 5e7;
     double nu_d = 1e7;
     double nu_p = 1e6;
@@ -505,6 +507,15 @@ public:
         energy_lookup_[PASSIVATED][PASSIVATED] = p_.e0;
         energy_lookup_[PASSIVATED][SUBSTRATE] = p_.e1;
         energy_lookup_[SUBSTRATE][PASSIVATED] = p_.e1;
+        // Li-C bond energy: carbon interacts with FREE/DEPOSITED/PASSIVATED
+        // atoms the same way SUBSTRATE does via e1, but with its own
+        // independently-tunable e_c value.
+        energy_lookup_[FREE][CARBON] = p_.e_c;
+        energy_lookup_[CARBON][FREE] = p_.e_c;
+        energy_lookup_[DEPOSITED][CARBON] = p_.e_c;
+        energy_lookup_[CARBON][DEPOSITED] = p_.e_c;
+        energy_lookup_[PASSIVATED][CARBON] = p_.e_c;
+        energy_lookup_[CARBON][PASSIVATED] = p_.e_c;
 
 // Prepare output directory.
 #ifndef __EMSCRIPTEN__
@@ -988,7 +999,8 @@ private:
                            {
                 if (at(nx, ny) == DEPOSITED ||
                     at(nx, ny) == PASSIVATED ||
-                    at(nx, ny) == SUBSTRATE)
+                    at(nx, ny) == SUBSTRATE ||
+                    at(nx, ny) == CARBON)
                     bonded = true; });
         return bonded ? DEPOSITED : FREE;
     }
@@ -1200,6 +1212,22 @@ public:
         }
 
         return count;
+    }
+
+    // Marks a single lattice cell as a graphite anode site. Call this for
+    // each user-drawn carbon cell after init_simulation(), then call
+    // finalize_carbon_placement() once at the end -- rebuilding the rate
+    // table per-cell would be wasteful for a large drawn region.
+    void set_carbon_site(int x, int y)
+    {
+        if (x < 0 || x >= p_.Nx || y < 0 || y >= p_.Ny)
+            return;
+        at(x, y) = CARBON;
+    }
+
+    void finalize_carbon_placement()
+    {
+        rebuild_all_rates();
     }
     std::string get_stats_json() const
     {
@@ -1492,11 +1520,13 @@ private:
         {
             uint8_t r, g, b;
         };
-        static const RGB PAL[4] = {
+        static const RGB PAL[6] = {
             {0x11, 0x11, 0x11}, // EMPTY
-            {0x55, 0x99, 0xdd}, // FREE      (steel blue)
-            {0xdd, 0x88, 0x33}, // DEPOSITED (amber)
-            {0x22, 0x22, 0x22}, // SUBSTRATE (dark grey)
+            {0x55, 0x99, 0xdd}, // FREE       (steel blue)
+            {0xdd, 0x88, 0x33}, // DEPOSITED  (amber)
+            {0x22, 0x22, 0x22}, // SUBSTRATE  (dark grey)
+            {0x99, 0x33, 0xcc}, // PASSIVATED (purple)
+            {0xdd, 0x22, 0x22}, // CARBON     (red)
         };
 
         // Write rows top-to-bottom (lattice row 0 = substrate = bottom of image).
@@ -1583,7 +1613,7 @@ private:
     std::chrono::steady_clock::time_point wall_start_;
 
     std::vector<int8_t> lattice_; // [y*Nx + x]
-    double energy_lookup_[5][5];
+    double energy_lookup_[6][6];
     int num_drop_;
     int num_hop_;
     int max_events_;
@@ -1650,6 +1680,7 @@ extern "C"
         double T,
         double e0,
         double e1,
+        double e_c,
         double nu_f,
         double nu_d,
         double nu_p,
@@ -1662,6 +1693,7 @@ extern "C"
         wasm_params.T = T;
         wasm_params.e0 = e0;
         wasm_params.e1 = e1;
+        wasm_params.e_c = e_c;
         wasm_params.nu_f = nu_f;
         wasm_params.nu_d = nu_d;
         // enable passivation
@@ -1708,6 +1740,20 @@ extern "C"
         }
 
         wasm_sim = new ElectrodepositionKMC(wasm_params);
+    }
+
+    EMSCRIPTEN_KEEPALIVE
+    void mark_carbon(int x, int y)
+    {
+        if (wasm_sim)
+            wasm_sim->set_carbon_site(x, y);
+    }
+
+    EMSCRIPTEN_KEEPALIVE
+    void finalize_carbon_placement()
+    {
+        if (wasm_sim)
+            wasm_sim->finalize_carbon_placement();
     }
 
     EMSCRIPTEN_KEEPALIVE
