@@ -4,7 +4,7 @@
  * WASM version of C++ port of LKMC_v2_commented_b.py.
  *
  *  * Build:
- * emcc lkmc-wasm.cpp -o public/lkmc-wasm.js -O3 -fexceptions -sINITIAL_MEMORY=268435456 -sEXPORT_ES6 -sMODULARIZE -sEXPORTED_FUNCTIONS="['_set_params','_update_simulation_params','_init_simulation','_run_steps','_play','_pause','_stop','_step_once','_playback_tick','_set_batch_size','_set_stats_interval','_get_playback_state','_get_lattice_data','_get_lattice','_get_lattice_size','_get_width','_get_height','_get_step','_get_wall_time','_get_time','_get_fill','_get_stats_json','_get_stats_json_len','_get_passivated','_cleanup_simulation','_force_update_frontend']" -sEXPORTED_RUNTIME_METHODS="['ccall','cwrap','HEAP8','wasmMemory']"
+ * emcc lkmc-wasm.cpp -o public/lkmc-wasm.js -O3 -fexceptions -sINITIAL_MEMORY=268435456 -sEXPORT_ES6 -sMODULARIZE -sEXPORTED_FUNCTIONS="['_set_params','_update_simulation_params','_init_simulation','_run_steps','_play','_pause','_stop','_step_once','_playback_tick','_set_batch_size','_set_stats_interval','_get_stats_interval','_get_playback_state','_get_lattice_data','_get_lattice','_get_lattice_size','_get_width','_get_height','_get_step','_get_wall_time','_get_time','_get_fill','_get_stats_json','_get_stats_json_len','_get_passivated','_cleanup_simulation','_force_update_frontend']" -sEXPORTED_RUNTIME_METHODS="['ccall','cwrap','HEAP8','wasmMemory']"
  * Exported WASM stuff:
  *   _set_params(int Nx, int Ny, double d0, double T, double e0, double e1, double nu_f, double nu_d, int seed) 
  *   _update_simulation_params(double d0, double T, double nu_f, double nu_d, double nu_p)
@@ -210,12 +210,12 @@ struct KMCParams
     double nu_f = 5e7;
     double nu_d = 1e7;
     double nu_p = 1e6;
-    double e_pass = 0.5; // eV — passivation activation energy barrier
-    // Literature range for SEI-forming decomposition reactions is
-    // roughly 0.3-0.5 eV, comparable to or above typical surface hop
-    // barriers (~0.15-0.3 eV here); 0.5 keeps passivation clearly
-    // subordinate to growth by default while still occurring on long
-    // runs, consistent with SEI formation being slow-but-irreversible.
+    double e_pass = 0.3; // eV — passivation activation energy barrier
+    // Literature-cited SEI-forming decomposition barriers cluster
+    // around 0.3-0.5 eV, close to (not far above) typical surface hop
+    // barriers here (~0.15-0.3 eV) -- 0.3 keeps passivation reachable
+    // and occasionally competitive rather than mathematically
+    // unreachable given nu_p's slider range.
     double kB = 8.617333262145e-5; // eV / K
     int max_steps = 400000;
     double max_time = 100.0;
@@ -1304,6 +1304,8 @@ public:
         stats_interval_ = std::max(1, interval);
     }
 
+    int stats_interval() const { return stats_interval_; }
+
     int playback_state() const
     {
         return static_cast<int>(playback_state_);
@@ -1736,10 +1738,15 @@ extern "C"
 #ifdef __EMSCRIPTEN__
         if (wasm_sim != nullptr)
         {
-            if (wasm_sim->step() % 10000 == 0)
-            {
-                updateFrontend(wasm_sim->step());
-            }
+            // Update the frontend on every run_steps() call rather than
+            // gating on step % 10000. The frontend already batches its own
+            // calls (currently 1000 simulated steps per animation frame in
+            // tick()), so this naturally ties visual refresh rate to that
+            // loop instead of double-throttling on top of it. This matters
+            // for transient states like FREE: an atom is only FREE for a
+            // single step before update_bonding_relaxation() promotes it to
+            // DEPOSITED, so infrequent snapshots almost always miss it.
+            updateFrontend(wasm_sim->step());
         }
         else
         {
@@ -1890,6 +1897,12 @@ extern "C"
     {
         if(wasm_sim)
             wasm_sim->set_stats_interval(interval);
+    }
+
+    EMSCRIPTEN_KEEPALIVE
+    int get_stats_interval()
+    {
+        return wasm_sim ? wasm_sim->stats_interval() : -1;
     }
 
     EMSCRIPTEN_KEEPALIVE
