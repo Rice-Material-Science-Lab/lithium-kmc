@@ -210,7 +210,12 @@ struct KMCParams
     double nu_f = 5e7;
     double nu_d = 1e7;
     double nu_p = 1e6;
-    double e_pass = 0.4; // eV — passivation activation energy barrier
+    double e_pass = 0.5; // eV — passivation activation energy barrier
+    // Literature range for SEI-forming decomposition reactions is
+    // roughly 0.3-0.5 eV, comparable to or above typical surface hop
+    // barriers (~0.15-0.3 eV here); 0.5 keeps passivation clearly
+    // subordinate to growth by default while still occurring on long
+    // runs, consistent with SEI formation being slow-but-irreversible.
     double kB = 8.617333262145e-5; // eV / K
     int max_steps = 400000;
     double max_time = 100.0;
@@ -820,9 +825,15 @@ private:
             // Apply the same Boltzmann suppression as hop/drop events so
             // passivation competes fairly with growth instead of
             // dominating regardless of temperature.
+            // empty_neighbors ranges 0-6 on this hex lattice; divide by 6
+            // so the exposure factor is a genuine 0-1 fraction instead of
+            // occasionally exceeding 1.0 (the old /3.0 let a fully exposed
+            // atom get up to 2x nu_p, silently doubling the effective
+            // attempt frequency beyond what the slider implies).
+            double exposure_fraction = empty_neighbors / 6.0;
             return p_.nu_p *
                 exp(-p_.e_pass / (p_.kB * p_.T)) *
-                (empty_neighbors / 3.0);
+                exposure_fraction;
         }
         if (atype != FREE && atype != DEPOSITED)
             return 0.0;
@@ -1169,7 +1180,11 @@ public:
         p_.nu_f = nu_f;
         p_.nu_d = nu_d;
         p_.nu_p = nu_p;
-        p_.e_pass = e_pass;
+        // Floor at 0.05 eV: passivation should always carry some
+        // suppression relative to growth. Prevents a caller (or a future
+        // plumbing bug) from silently disabling the Boltzmann barrier by
+        // passing 0, which would let passivation dominate unrealistically.
+        p_.e_pass = std::max(e_pass, 0.05);
 
         // Important: old rates are now invalid
         parameters_changed_ = true;
@@ -1649,7 +1664,9 @@ extern "C"
         wasm_params.nu_d = nu_d;
         // enable passivation
         wasm_params.nu_p = nu_p;
-        wasm_params.e_pass = e_pass;
+        // Same floor as update_params(), applied here too since
+        // set_params() is the other entry point that sets e_pass.
+        wasm_params.e_pass = std::max(e_pass, 0.05);
         wasm_params.rng_seed = seed;
 
         wasm_params.pcg.seed((uint64_t)seed);
