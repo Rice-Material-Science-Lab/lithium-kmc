@@ -4,7 +4,7 @@
  * WASM version of C++ port of LKMC_v2_commented_b.py.
  *
  *  * Build:
- * emcc lkmc-wasm.cpp -o public/lkmc-wasm.js -O3 -fexceptions -sINITIAL_MEMORY=268435456 -sEXPORT_ES6 -sMODULARIZE -sEXPORTED_FUNCTIONS="['_set_params','_update_simulation_params','_init_simulation','_run_steps','_play','_pause','_stop','_step_once','_playback_tick','_set_batch_size','_set_stats_interval','_get_stats_interval','_get_playback_state','_mark_carbon','_unmark_carbon','_finalize_carbon_placement','_get_lattice_data','_get_lattice','_get_lattice_size','_get_width','_get_height','_get_step','_get_wall_time','_get_time','_get_fill','_get_stats_json','_get_stats_json_len','_get_passivated','_get_terminated','_get_cell_coordination','_cleanup_simulation','_force_update_frontend']" -sEXPORTED_RUNTIME_METHODS="['ccall','cwrap','HEAP8','wasmMemory']"
+ * emcc lkmc-wasm.cpp -o public/lkmc-wasm.js -O3 -fexceptions -sINITIAL_MEMORY=268435456 -sEXPORT_ES6 -sMODULARIZE -sEXPORTED_FUNCTIONS="['_set_params','_update_simulation_params','_init_simulation','_run_steps','_play','_pause','_stop','_step_once','_playback_tick','_set_batch_size','_set_stats_interval','_get_stats_interval','_get_playback_state','_mark_carbon','_unmark_carbon','_finalize_carbon_placement','_get_lattice_data','_get_lattice','_get_lattice_size','_get_width','_get_height','_get_step','_get_wall_time','_get_time','_get_fill','_get_stats_json','_get_stats_json_len','_get_passivated','_get_terminated','_get_cell_coordination','_get_snapshot_count','_get_snapshot_step','_get_snapshot_lattice','_cleanup_simulation','_force_update_frontend']" -sEXPORTED_RUNTIME_METHODS="['ccall','cwrap','HEAP8','wasmMemory']"
  * Exported WASM stuff:
  *   _set_params(int Nx, int Ny, double d0, double T, double e0, double e1, double nu_f, double nu_d, int seed) 
  *   _update_simulation_params(double d0, double T, double nu_f, double nu_d, double nu_p, double e_pass, double e_c, double e0, double e1)
@@ -639,6 +639,25 @@ public:
         if (x < 0 || x >= p_.Nx || y < 0 || y >= p_.Ny)
             return -1;
         return coordination_number(x, y);
+    }
+
+    int snapshot_count() const
+    {
+        return (int)lattice_snapshots_.size();
+    }
+
+    int snapshot_step_at(int idx) const
+    {
+        if (idx < 0 || idx >= (int)lattice_snapshots_.size())
+            return -1;
+        return lattice_snapshots_[idx].step;
+    }
+
+    const int8_t *snapshot_lattice_at(int idx) const
+    {
+        if (idx < 0 || idx >= (int)lattice_snapshots_.size())
+            return nullptr;
+        return lattice_snapshots_[idx].data.data();
     }
     double wall_time() const
     {
@@ -1475,6 +1494,20 @@ private:
             stats_history_.swap(compacted);
             stats_interval_ *= 2;
         }
+
+        // Snapshot the full lattice at the same cadence as stats, so the
+        // frontend can scrub back through history rather than only seeing
+        // the live state. Bounded the same way -- halve and keep going
+        // once the cap is hit.
+        lattice_snapshots_.push_back({step_, time_, lattice_});
+        if (lattice_snapshots_.size() > kMaxLatticeSnapshots)
+        {
+            std::vector<LatticeSnapshot> compacted;
+            compacted.reserve(lattice_snapshots_.size() / 2 + 1);
+            for (size_t i = 0; i < lattice_snapshots_.size(); i += 2)
+                compacted.push_back(std::move(lattice_snapshots_[i]));
+            lattice_snapshots_.swap(compacted);
+        }
     }
 
     Counts counts() const
@@ -1699,6 +1732,15 @@ private:
     std::vector<std::pair<int, int>> step_all_changed_;
 
     static constexpr size_t kMaxStatsRows = 5000;
+    static constexpr size_t kMaxLatticeSnapshots = 300;
+
+    struct LatticeSnapshot
+    {
+        int step;
+        double time;
+        std::vector<int8_t> data;
+    };
+    std::vector<LatticeSnapshot> lattice_snapshots_;
 
     double time_ = 0.0;
     int step_ = 0;
@@ -2044,6 +2086,24 @@ extern "C"
     int get_cell_coordination(int x, int y)
     {
         return wasm_sim ? wasm_sim->get_coordination_at(x, y) : -1;
+    }
+
+    EMSCRIPTEN_KEEPALIVE
+    int get_snapshot_count()
+    {
+        return wasm_sim ? wasm_sim->snapshot_count() : 0;
+    }
+
+    EMSCRIPTEN_KEEPALIVE
+    int get_snapshot_step(int idx)
+    {
+        return wasm_sim ? wasm_sim->snapshot_step_at(idx) : -1;
+    }
+
+    EMSCRIPTEN_KEEPALIVE
+    const int8_t *get_snapshot_lattice(int idx)
+    {
+        return wasm_sim ? wasm_sim->snapshot_lattice_at(idx) : nullptr;
     }
 
     EMSCRIPTEN_KEEPALIVE
