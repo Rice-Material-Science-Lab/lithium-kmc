@@ -4,7 +4,7 @@
  * WASM version of C++ port of LKMC_v2_commented_b.py.
  *
  *  * Build:
- * emcc lkmc-wasm.cpp -o public/lkmc-wasm.js -O3 -fexceptions -sINITIAL_MEMORY=268435456 -sEXPORT_ES6 -sMODULARIZE -sEXPORTED_FUNCTIONS="['_set_params','_update_simulation_params','_init_simulation','_run_steps','_play','_pause','_stop','_step_once','_playback_tick','_set_batch_size','_set_stats_interval','_get_stats_interval','_get_playback_state','_mark_carbon','_unmark_carbon','_finalize_carbon_placement','_get_lattice_data','_get_lattice','_get_lattice_size','_get_width','_get_height','_get_step','_get_wall_time','_get_time','_get_fill','_get_stats_json','_get_stats_json_len','_get_passivated','_get_terminated','_get_cell_coordination','_get_snapshot_count','_get_snapshot_step','_get_snapshot_lattice','_cleanup_simulation','_force_update_frontend']" -sEXPORTED_RUNTIME_METHODS="['ccall','cwrap','HEAP8','wasmMemory']"
+ * emcc lkmc-wasm.cpp -o public/lkmc-wasm.js -O3 -fexceptions -sINITIAL_MEMORY=268435456 -sEXPORT_ES6 -sMODULARIZE -sEXPORTED_FUNCTIONS="['_set_params','_update_simulation_params','_save_state','_get_save_state_len','_load_state','_peek_state_dimensions','_init_simulation','_run_steps','_play','_pause','_stop','_step_once','_playback_tick','_set_batch_size','_set_stats_interval','_get_stats_interval','_get_playback_state','_mark_carbon','_unmark_carbon','_finalize_carbon_placement','_get_lattice_data','_get_lattice','_get_lattice_size','_get_width','_get_height','_get_step','_get_wall_time','_get_time','_get_fill','_get_stats_json','_get_stats_json_len','_get_passivated','_get_terminated','_get_cell_coordination','_get_snapshot_count','_get_snapshot_step','_get_snapshot_lattice','_cleanup_simulation','_force_update_frontend']" -sEXPORTED_RUNTIME_METHODS="['ccall','cwrap','HEAP8','wasmMemory']"
  * Exported WASM stuff:
  *   _set_params(int Nx, int Ny, double d0, double T, double e0, double e1, double e_c, double nu_f, double nu_d, double nu_p, double e_pass, double nu_dp, double e_dp, int seed)
  *   _update_simulation_params(double d0, double T, double nu_f, double nu_d, double nu_p, double e_pass, double e_c, double e0, double e1, double nu_dp, double e_dp)
@@ -670,6 +670,52 @@ public:
         if (idx < 0 || idx >= (int)lattice_snapshots_.size())
             return nullptr;
         return lattice_snapshots_[idx].data.data();
+    }
+    // Serializes everything needed to resume a run: dimensions, step/time,
+    // the raw lattice, and current params. Format is a flat buffer the
+    // frontend can base64/store and hand back later.
+    std::string serialize_state() const
+    {
+        std::ostringstream out(std::ios::binary);
+        auto write = [&](const void *ptr, size_t n) {
+            out.write(reinterpret_cast<const char *>(ptr), n);
+        };
+        int32_t nx = p_.Nx, ny = p_.Ny;
+        write(&nx, sizeof(nx));
+        write(&ny, sizeof(ny));
+        write(&step_, sizeof(step_));
+        write(&time_, sizeof(time_));
+        write(lattice_.data(), lattice_.size());
+        return out.str();
+    }
+
+    static bool deserialize_dimensions(const std::string &blob, int &nx, int &ny)
+    {
+        if (blob.size() < sizeof(int32_t) * 2)
+            return false;
+        memcpy(&nx, blob.data(), sizeof(int32_t));
+        memcpy(&ny, blob.data() + sizeof(int32_t), sizeof(int32_t));
+        return true;
+    }
+
+    // Restores lattice/step/time from a blob produced by serialize_state(),
+    // matching this instance's Nx/Ny (caller must construct with the right
+    // dimensions first via set_params + init_simulation).
+    bool restore_state(const std::string &blob)
+    {
+        size_t header = sizeof(int32_t) * 2 + sizeof(step_) + sizeof(time_);
+        if (blob.size() < header + lattice_.size())
+            return false;
+
+        size_t offset = sizeof(int32_t) * 2;
+        memcpy(&step_, blob.data() + offset, sizeof(step_));
+        offset += sizeof(step_);
+        memcpy(&time_, blob.data() + offset, sizeof(time_));
+        offset += sizeof(time_);
+        memcpy(lattice_.data(), blob.data() + offset, lattice_.size());
+
+        rebuild_all_rates();
+        return true;
     }
     double wall_time() const
     {
@@ -2179,6 +2225,51 @@ extern "C"
     const int8_t *get_snapshot_lattice(int idx)
     {
         return wasm_sim ? wasm_sim->snapshot_lattice_at(idx) : nullptr;
+    }
+    
+    static std::string g_save_state_buf;
+
+    EMSCRIPTEN_KEEPALIVE
+    const char *save_state()
+    {
+        if (!wasm_sim)
+        {
+            g_save_state_buf.clear();
+            return g_save_state_buf.c_str();
+        }
+        g_save_state_buf = wasm_sim->serialize_state();
+        return g_save_state_buf.c_str();
+    }
+
+    EMSCRIPTEN_KEEPALIVE
+    int get_save_state_len()
+    {
+        return (int)g_save_state_buf.size();
+    }
+
+    // Caller must have already called set_params (with matching Nx/Ny read
+    // from the blob) and init_simulation before calling this.
+    EMSCRIPTEN_KEEPALIVE
+    int load_state(const char *data, int len)
+    {
+        if (!wasm_sim || !data || len <= 0)
+            return 0;
+        std::string blob(data, len);
+        return wasm_sim->restore_state(blob) ? 1 : 0;
+    }
+
+    EMSCRIPTEN_KEEPALIVE
+    int peek_state_dimensions(const char *data, int len, int *out_nx, int *out_ny)
+    {
+        if (!data || len <= 0)
+            return 0;
+        std::string blob(data, len);
+        int nx = 0, ny = 0;
+        if (!ElectrodepositionKMC::deserialize_dimensions(blob, nx, ny))
+            return 0;
+        if (out_nx) *out_nx = nx;
+        if (out_ny) *out_ny = ny;
+        return 1;
     }
 
     EMSCRIPTEN_KEEPALIVE
