@@ -7,8 +7,7 @@
  * emcc lkmc-wasm.cpp -o public/lkmc-wasm.js -O3 -fexceptions -sINITIAL_MEMORY=268435456 -sEXPORT_ES6 -sMODULARIZE -sEXPORTED_FUNCTIONS="['_set_params','_update_simulation_params','_init_simulation','_run_steps','_play','_pause','_stop','_step_once','_playback_tick','_set_batch_size','_set_stats_interval','_get_stats_interval','_get_playback_state','_mark_carbon','_unmark_carbon','_finalize_carbon_placement','_get_lattice_data','_get_lattice','_get_lattice_size','_get_width','_get_height','_get_step','_get_wall_time','_get_time','_get_fill','_get_stats_json','_get_stats_json_len','_get_passivated','_get_terminated','_cleanup_simulation','_force_update_frontend']" -sEXPORTED_RUNTIME_METHODS="['ccall','cwrap','HEAP8','wasmMemory']"
  * Exported WASM stuff:
  *   _set_params(int Nx, int Ny, double d0, double T, double e0, double e1, double nu_f, double nu_d, int seed) 
- *   _update_simulation_params(double d0, double T, double nu_f, double nu_d, double nu_p)
- *   _init_simulation()
+ *   _update_simulation_params(double d0, double T, double nu_f, double nu_d, double nu_p, double e_pass, double e_c, double e0, double e1)
  *   _run_steps(int steps)
  *   _get_lattice_data()
  *   _get_width()
@@ -1194,7 +1193,9 @@ public:
         double nu_d,
         double nu_p,
         double e_pass,
-        double e_c
+        double e_c,
+        double e0,
+        double e1
     )
     {
         p_.d0 = d0;
@@ -1208,6 +1209,8 @@ public:
         // passing 0, which would let passivation dominate unrealistically.
         p_.e_pass = std::max(e_pass, 0.05);
         p_.e_c = e_c;
+        p_.e0 = e0;
+        p_.e1 = e1;
 
         // energy_lookup_ entries for CARBON depend on p_.e_c, so they must
         // be refreshed whenever e_c changes live -- not just the rate
@@ -1218,6 +1221,24 @@ public:
         energy_lookup_[CARBON][DEPOSITED] = p_.e_c;
         energy_lookup_[PASSIVATED][CARBON] = p_.e_c;
         energy_lookup_[CARBON][PASSIVATED] = p_.e_c;
+
+        // energy_lookup_ entries that depend on p_.e0 / p_.e1 must also be
+        // refreshed live, same reasoning as CARBON above.
+        energy_lookup_[FREE][DEPOSITED] = p_.e0;
+        energy_lookup_[DEPOSITED][FREE] = p_.e0;
+        energy_lookup_[DEPOSITED][DEPOSITED] = p_.e0;
+        energy_lookup_[FREE][SUBSTRATE] = p_.e1;
+        energy_lookup_[SUBSTRATE][FREE] = p_.e1;
+        energy_lookup_[DEPOSITED][SUBSTRATE] = p_.e1;
+        energy_lookup_[SUBSTRATE][DEPOSITED] = p_.e1;
+        energy_lookup_[SUBSTRATE][SUBSTRATE] = p_.e1;
+        energy_lookup_[FREE][PASSIVATED] = p_.e0;
+        energy_lookup_[PASSIVATED][FREE] = p_.e0;
+        energy_lookup_[DEPOSITED][PASSIVATED] = p_.e0;
+        energy_lookup_[PASSIVATED][DEPOSITED] = p_.e0;
+        energy_lookup_[PASSIVATED][PASSIVATED] = p_.e0;
+        energy_lookup_[PASSIVATED][SUBSTRATE] = p_.e1;
+        energy_lookup_[SUBSTRATE][PASSIVATED] = p_.e1;
 
         // Important: old rates are now invalid
         parameters_changed_ = true;
@@ -1748,7 +1769,9 @@ extern "C"
         double nu_d,
         double nu_p,
         double e_pass,
-        double e_c
+        double e_c,
+        double e0,
+        double e1
     )
     {
         if (!wasm_sim)
@@ -1761,7 +1784,9 @@ extern "C"
             nu_d,
             nu_p,
             e_pass,
-            e_c
+            e_c,
+            e0,
+            e1
         );
     }
 
