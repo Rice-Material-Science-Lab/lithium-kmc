@@ -87,6 +87,13 @@ extern "C"
             window.onSimulationTerminated();
         }
     });
+
+    EM_JS(void, notifyBatchProgress, (int done, int total), {
+        if (typeof window.onBatchRunProgress === "function")
+        {
+            window.onBatchRunProgress(done, total);
+        }
+    });
 }
 #endif
 #ifndef __EMSCRIPTEN__
@@ -2299,6 +2306,84 @@ extern "C"
         if (out_nx) *out_nx = nx;
         if (out_ny) *out_ny = ny;
         return 1;
+    }
+
+    static std::string g_batch_json_buf;
+
+    EMSCRIPTEN_KEEPALIVE
+    void run_batch(
+        double *d0_arr,
+        double *T_arr,
+        double *e0_arr,
+        double *e1_arr,
+        int num_runs,
+        int nx,
+        int ny,
+        int steps_per_run,
+        int base_seed)
+    {
+        std::ostringstream json;
+        json << "[";
+
+        for (int i = 0; i < num_runs; i++)
+        {
+            KMCParams p = wasm_params; // inherit current defaults (carbon energies, etc.)
+            p.Nx = nx;
+            p.Ny = ny;
+            p.d0 = d0_arr[i];
+            p.T = T_arr[i];
+            p.e0 = e0_arr[i];
+            p.e1 = e1_arr[i];
+            p.rng_seed = base_seed + i;
+            p.pcg.seed((uint64_t)p.rng_seed);
+
+            auto t0 = std::chrono::steady_clock::now();
+            ElectrodepositionKMC sim(p);
+            int actual_steps = 0;
+            for (int s = 0; s < steps_per_run; s++)
+            {
+                if (!sim.execute_step())
+                    break;
+                actual_steps++;
+            }
+            double wall = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - t0
+            ).count();
+
+            json << "{"
+                 << "\"index\":" << i << ","
+                 << "\"d0\":" << p.d0 << ","
+                 << "\"T\":" << p.T << ","
+                 << "\"e0\":" << p.e0 << ","
+                 << "\"e1\":" << p.e1 << ","
+                 << "\"steps_run\":" << actual_steps << ","
+                 << "\"final_step\":" << sim.step() << ","
+                 << "\"final_time\":" << sim.time() << ","
+                 << "\"fill_pct\":" << sim.fill_percentage() << ","
+                 << "\"passivated\":" << sim.passivated_count() << ","
+                 << "\"terminated\":" << (sim.is_terminated() ? 1 : 0) << ","
+                 << "\"wall_time\":" << wall
+                 << "}";
+            if (i + 1 < num_runs)
+                json << ",";
+
+#ifdef __EMSCRIPTEN__
+            EM_ASM({
+                if (typeof window.onBatchRunProgress === "function") {
+                    window.onBatchRunProgress($0, $1);
+                }
+            }, i + 1, num_runs);
+#endif
+        }
+
+        json << "]";
+        g_batch_json_buf = json.str();
+    }
+
+    EMSCRIPTEN_KEEPALIVE
+    const char *get_batch_json()
+    {
+        return g_batch_json_buf.c_str();
     }
 
     EMSCRIPTEN_KEEPALIVE
