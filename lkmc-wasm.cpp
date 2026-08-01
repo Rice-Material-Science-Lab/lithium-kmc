@@ -4,11 +4,10 @@
  * WASM version of C++ port of LKMC_v2_commented_b.py.
  *
  *  * Build:
- * emcc lkmc-wasm.cpp -o public/lkmc-wasm.js -O3 -fexceptions -sINITIAL_MEMORY=268435456 -sEXPORT_ES6 -sMODULARIZE -sEXPORTED_FUNCTIONS="['_set_params','_update_simulation_params','_init_simulation','_run_steps','_play','_pause','_stop','_step_once','_playback_tick','_set_batch_size','_set_stats_interval','_get_stats_interval','_get_playback_state','_mark_carbon','_unmark_carbon','_finalize_carbon_placement','_get_lattice_data','_get_lattice','_get_lattice_size','_get_width','_get_height','_get_step','_get_wall_time','_get_time','_get_fill','_get_stats_json','_get_stats_json_len','_get_passivated','_cleanup_simulation','_force_update_frontend']" -sEXPORTED_RUNTIME_METHODS="['ccall','cwrap','HEAP8','wasmMemory']"
+ * emcc lkmc-wasm.cpp -o public/lkmc-wasm.js -O3 -fexceptions -sINITIAL_MEMORY=268435456 -sEXPORT_ES6 -sMODULARIZE -sEXPORTED_FUNCTIONS="['_set_params','_update_simulation_params','_init_simulation','_run_steps','_play','_pause','_stop','_step_once','_playback_tick','_set_batch_size','_set_stats_interval','_get_stats_interval','_get_playback_state','_mark_carbon','_unmark_carbon','_finalize_carbon_placement','_get_lattice_data','_get_lattice','_get_lattice_size','_get_width','_get_height','_get_step','_get_wall_time','_get_time','_get_fill','_get_stats_json','_get_stats_json_len','_get_passivated','_get_terminated','_cleanup_simulation','_force_update_frontend']" -sEXPORTED_RUNTIME_METHODS="['ccall','cwrap','HEAP8','wasmMemory']"
  * Exported WASM stuff:
  *   _set_params(int Nx, int Ny, double d0, double T, double e0, double e1, double nu_f, double nu_d, int seed) 
- *   _update_simulation_params(double d0, double T, double nu_f, double nu_d, double nu_p)
- *   _init_simulation()
+ *   _update_simulation_params(double d0, double T, double nu_f, double nu_d, double nu_p, double e_pass, double e_c, double e0, double e1)
  *   _run_steps(int steps)
  *   _get_lattice_data()
  *   _get_width()
@@ -79,6 +78,13 @@ extern "C"
         if (typeof window.updateSimulation === "function")
         {
             window.updateSimulation(step);
+        }
+    });
+
+    EM_JS(void, notifySimTerminated, (), {
+        if (typeof window.onSimulationTerminated === "function")
+        {
+            window.onSimulationTerminated();
         }
     });
 }
@@ -623,6 +629,7 @@ public:
     }
 
     int step() const { return step_; }
+    bool is_terminated() const { return terminated_; }
     double time() const { return time_; }
     double wall_time() const
     {
@@ -1060,6 +1067,9 @@ public:
     // -----------------------------------------------------------------------
     bool execute_step()
     {
+        if (terminated_)
+            return false;
+
         if(parameters_changed_)
         {
             rebuild_all_rates();
@@ -1081,12 +1091,6 @@ public:
 
         if (r_tot <= 0.0)
         {
-            std::cerr 
-                << "\nKMC STOP: total event rate reached zero\n"
-                << "step=" << step_
-                << " time=" << time_
-                << "\n";
-
             int empty = 0;
             int free = 0;
             int deposited = 0;
@@ -1100,13 +1104,15 @@ public:
                 else if (v == PASSIVATED) passivated++;
             }
 
-            std::cerr
-                << "EMPTY=" << empty
-                << " FREE=" << free
-                << " DEPOSITED=" << deposited
-                << " PASSIVATED=" << passivated
-                << "\n";
+            // printf (stdout) instead of std::cerr (stderr) -- Emscripten's
+            // default glue code routes stderr straight to console.error,
+            // which is what was showing up as a JS console error.
+            printf(
+                "KMC STOP: total event rate reached zero step=%d time=%f EMPTY=%d FREE=%d DEPOSITED=%d PASSIVATED=%d\n",
+                step_, time_, empty, free, deposited, passivated
+            );
 
+            terminated_ = true;
             return false;
         }
 
@@ -1185,7 +1191,9 @@ public:
         double nu_d,
         double nu_p,
         double e_pass,
-        double e_c
+        double e_c,
+        double e0,
+        double e1
     )
     {
         p_.d0 = d0;
@@ -1199,6 +1207,8 @@ public:
         // passing 0, which would let passivation dominate unrealistically.
         p_.e_pass = std::max(e_pass, 0.05);
         p_.e_c = e_c;
+        p_.e0 = e0;
+        p_.e1 = e1;
 
         // energy_lookup_ entries for CARBON depend on p_.e_c, so they must
         // be refreshed whenever e_c changes live -- not just the rate
@@ -1209,6 +1219,24 @@ public:
         energy_lookup_[CARBON][DEPOSITED] = p_.e_c;
         energy_lookup_[PASSIVATED][CARBON] = p_.e_c;
         energy_lookup_[CARBON][PASSIVATED] = p_.e_c;
+
+        // energy_lookup_ entries that depend on p_.e0 / p_.e1 must also be
+        // refreshed live, same reasoning as CARBON above.
+        energy_lookup_[FREE][DEPOSITED] = p_.e0;
+        energy_lookup_[DEPOSITED][FREE] = p_.e0;
+        energy_lookup_[DEPOSITED][DEPOSITED] = p_.e0;
+        energy_lookup_[FREE][SUBSTRATE] = p_.e1;
+        energy_lookup_[SUBSTRATE][FREE] = p_.e1;
+        energy_lookup_[DEPOSITED][SUBSTRATE] = p_.e1;
+        energy_lookup_[SUBSTRATE][DEPOSITED] = p_.e1;
+        energy_lookup_[SUBSTRATE][SUBSTRATE] = p_.e1;
+        energy_lookup_[FREE][PASSIVATED] = p_.e0;
+        energy_lookup_[PASSIVATED][FREE] = p_.e0;
+        energy_lookup_[DEPOSITED][PASSIVATED] = p_.e0;
+        energy_lookup_[PASSIVATED][DEPOSITED] = p_.e0;
+        energy_lookup_[PASSIVATED][PASSIVATED] = p_.e0;
+        energy_lookup_[PASSIVATED][SUBSTRATE] = p_.e1;
+        energy_lookup_[SUBSTRATE][PASSIVATED] = p_.e1;
 
         // Important: old rates are now invalid
         parameters_changed_ = true;
@@ -1676,6 +1704,7 @@ private:
     PlaybackState playback_state_ = PlaybackState::STOPPED;
 
     bool stop_requested_ = false;
+    bool terminated_ = false;
 
     int playback_batch_ = 100;
 
@@ -1738,7 +1767,9 @@ extern "C"
         double nu_d,
         double nu_p,
         double e_pass,
-        double e_c
+        double e_c,
+        double e0,
+        double e1
     )
     {
         if (!wasm_sim)
@@ -1751,7 +1782,9 @@ extern "C"
             nu_d,
             nu_p,
             e_pass,
-            e_c
+            e_c,
+            e0,
+            e1
         );
     }
 
@@ -1826,6 +1859,8 @@ extern "C"
             // single step before update_bonding_relaxation() promotes it to
             // DEPOSITED, so infrequent snapshots almost always miss it.
             updateFrontend(wasm_sim->step());
+            if (wasm_sim->is_terminated())
+                notifySimTerminated();
         }
         else
         {
@@ -1988,6 +2023,12 @@ extern "C"
     int get_playback_state()
     {
         return wasm_sim ? wasm_sim->playback_state() : 0;
+    }
+
+    EMSCRIPTEN_KEEPALIVE
+    int get_terminated()
+    {
+        return (wasm_sim && wasm_sim->is_terminated()) ? 1 : 0;
     }
 
     EMSCRIPTEN_KEEPALIVE
