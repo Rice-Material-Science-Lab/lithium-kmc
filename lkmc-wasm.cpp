@@ -4,7 +4,7 @@
  * WASM version of C++ port of LKMC_v2_commented_b.py.
  *
  *  * Build:
- * emcc lkmc-wasm.cpp -o public/lkmc-wasm.js -O3 -fexceptions -sINITIAL_MEMORY=268435456 -sEXPORT_ES6 -sMODULARIZE -sEXPORTED_FUNCTIONS="['_set_params','_update_simulation_params','_init_simulation','_run_steps','_play','_pause','_stop','_step_once','_playback_tick','_set_batch_size','_set_stats_interval','_get_stats_interval','_get_playback_state','_mark_carbon','_unmark_carbon','_finalize_carbon_placement','_get_lattice_data','_get_lattice','_get_lattice_size','_get_width','_get_height','_get_step','_get_wall_time','_get_time','_get_fill','_get_stats_json','_get_stats_json_len','_get_passivated','_cleanup_simulation','_force_update_frontend']" -sEXPORTED_RUNTIME_METHODS="['ccall','cwrap','HEAP8','wasmMemory']"
+ * emcc lkmc-wasm.cpp -o public/lkmc-wasm.js -O3 -fexceptions -sINITIAL_MEMORY=268435456 -sEXPORT_ES6 -sMODULARIZE -sEXPORTED_FUNCTIONS="['_set_params','_update_simulation_params','_init_simulation','_run_steps','_play','_pause','_stop','_step_once','_playback_tick','_set_batch_size','_set_stats_interval','_get_stats_interval','_get_playback_state','_mark_carbon','_unmark_carbon','_finalize_carbon_placement','_get_lattice_data','_get_lattice','_get_lattice_size','_get_width','_get_height','_get_step','_get_wall_time','_get_time','_get_fill','_get_stats_json','_get_stats_json_len','_get_passivated','_get_terminated','_cleanup_simulation','_force_update_frontend']" -sEXPORTED_RUNTIME_METHODS="['ccall','cwrap','HEAP8','wasmMemory']"
  * Exported WASM stuff:
  *   _set_params(int Nx, int Ny, double d0, double T, double e0, double e1, double nu_f, double nu_d, int seed) 
  *   _update_simulation_params(double d0, double T, double nu_f, double nu_d, double nu_p)
@@ -79,6 +79,13 @@ extern "C"
         if (typeof window.updateSimulation === "function")
         {
             window.updateSimulation(step);
+        }
+    });
+
+    EM_JS(void, notifySimTerminated, (), {
+        if (typeof window.onSimulationTerminated === "function")
+        {
+            window.onSimulationTerminated();
         }
     });
 }
@@ -623,6 +630,7 @@ public:
     }
 
     int step() const { return step_; }
+    bool is_terminated() const { return terminated_; }
     double time() const { return time_; }
     double wall_time() const
     {
@@ -1107,6 +1115,7 @@ public:
                 << " PASSIVATED=" << passivated
                 << "\n";
 
+            terminated_ = true;
             return false;
         }
 
@@ -1676,6 +1685,7 @@ private:
     PlaybackState playback_state_ = PlaybackState::STOPPED;
 
     bool stop_requested_ = false;
+    bool terminated_ = false;
 
     int playback_batch_ = 100;
 
@@ -1826,6 +1836,8 @@ extern "C"
             // single step before update_bonding_relaxation() promotes it to
             // DEPOSITED, so infrequent snapshots almost always miss it.
             updateFrontend(wasm_sim->step());
+            if (wasm_sim->is_terminated())
+                notifySimTerminated();
         }
         else
         {
@@ -1988,6 +2000,12 @@ extern "C"
     int get_playback_state()
     {
         return wasm_sim ? wasm_sim->playback_state() : 0;
+    }
+
+    EMSCRIPTEN_KEEPALIVE
+    int get_terminated()
+    {
+        return (wasm_sim && wasm_sim->is_terminated()) ? 1 : 0;
     }
 
     EMSCRIPTEN_KEEPALIVE
