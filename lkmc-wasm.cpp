@@ -4,7 +4,7 @@
  * WASM version of C++ port of LKMC_v2_commented_b.py.
  *
  *  * Build:
- * emcc lkmc-wasm.cpp -o public/lkmc-wasm.js -O3 -fexceptions -sINITIAL_MEMORY=268435456 -sEXPORT_ES6 -sMODULARIZE -sEXPORTED_FUNCTIONS="['_set_params','_update_simulation_params','_init_simulation','_run_steps','_play','_pause','_stop','_step_once','_playback_tick','_set_batch_size','_set_stats_interval','_get_stats_interval','_get_playback_state','_mark_carbon','_finalize_carbon_placement', '_get_lattice_data','_get_lattice','_get_lattice_size','_get_width','_get_height','_get_step','_get_wall_time','_get_time','_get_fill','_get_stats_json','_get_stats_json_len','_get_passivated','_cleanup_simulation','_force_update_frontend']" -sEXPORTED_RUNTIME_METHODS="['ccall','cwrap','HEAP8','wasmMemory']"
+ * emcc lkmc-wasm.cpp -o public/lkmc-wasm.js -O3 -fexceptions -sINITIAL_MEMORY=268435456 -sEXPORT_ES6 -sMODULARIZE -sEXPORTED_FUNCTIONS="['_set_params','_update_simulation_params','_init_simulation','_run_steps','_play','_pause','_stop','_step_once','_playback_tick','_set_batch_size','_set_stats_interval','_get_stats_interval','_get_playback_state','_mark_carbon','_unmark_carbon','_finalize_carbon_placement','_get_lattice_data','_get_lattice','_get_lattice_size','_get_width','_get_height','_get_step','_get_wall_time','_get_time','_get_fill','_get_stats_json','_get_stats_json_len','_get_passivated','_cleanup_simulation','_force_update_frontend']" -sEXPORTED_RUNTIME_METHODS="['ccall','cwrap','HEAP8','wasmMemory']"
  * Exported WASM stuff:
  *   _set_params(int Nx, int Ny, double d0, double T, double e0, double e1, double nu_f, double nu_d, int seed) 
  *   _update_simulation_params(double d0, double T, double nu_f, double nu_d, double nu_p)
@@ -1184,7 +1184,8 @@ public:
         double nu_f,
         double nu_d,
         double nu_p,
-        double e_pass
+        double e_pass,
+        double e_c
     )
     {
         p_.d0 = d0;
@@ -1197,6 +1198,17 @@ public:
         // plumbing bug) from silently disabling the Boltzmann barrier by
         // passing 0, which would let passivation dominate unrealistically.
         p_.e_pass = std::max(e_pass, 0.05);
+        p_.e_c = e_c;
+
+        // energy_lookup_ entries for CARBON depend on p_.e_c, so they must
+        // be refreshed whenever e_c changes live -- not just the rate
+        // table (handled by parameters_changed_ below).
+        energy_lookup_[FREE][CARBON] = p_.e_c;
+        energy_lookup_[CARBON][FREE] = p_.e_c;
+        energy_lookup_[DEPOSITED][CARBON] = p_.e_c;
+        energy_lookup_[CARBON][DEPOSITED] = p_.e_c;
+        energy_lookup_[PASSIVATED][CARBON] = p_.e_c;
+        energy_lookup_[CARBON][PASSIVATED] = p_.e_c;
 
         // Important: old rates are now invalid
         parameters_changed_ = true;
@@ -1223,6 +1235,18 @@ public:
         if (x < 0 || x >= p_.Nx || y < 0 || y >= p_.Ny)
             return;
         at(x, y) = CARBON;
+    }
+
+    // Reverts a cell that was previously marked carbon back to EMPTY.
+    // Used for live toggle-off; only safe to call on a cell that is
+    // actually CARBON (a site with an atom already bonded to it is left
+    // alone rather than silently deleting that atom).
+    void unset_carbon_site(int x, int y)
+    {
+        if (x < 0 || x >= p_.Nx || y < 0 || y >= p_.Ny)
+            return;
+        if (at(x, y) == CARBON)
+            at(x, y) = EMPTY;
     }
 
     void finalize_carbon_placement()
@@ -1713,7 +1737,8 @@ extern "C"
         double nu_f,
         double nu_d,
         double nu_p,
-        double e_pass
+        double e_pass,
+        double e_c
     )
     {
         if (!wasm_sim)
@@ -1725,7 +1750,8 @@ extern "C"
             nu_f,
             nu_d,
             nu_p,
-            e_pass
+            e_pass,
+            e_c
         );
     }
 
@@ -1747,6 +1773,13 @@ extern "C"
     {
         if (wasm_sim)
             wasm_sim->set_carbon_site(x, y);
+    }
+
+    EMSCRIPTEN_KEEPALIVE
+    void unmark_carbon(int x, int y)
+    {
+        if (wasm_sim)
+            wasm_sim->unset_carbon_site(x, y);
     }
 
     EMSCRIPTEN_KEEPALIVE
