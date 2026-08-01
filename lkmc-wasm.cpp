@@ -6,8 +6,8 @@
  *  * Build:
  * emcc lkmc-wasm.cpp -o public/lkmc-wasm.js -O3 -fexceptions -sINITIAL_MEMORY=268435456 -sEXPORT_ES6 -sMODULARIZE -sEXPORTED_FUNCTIONS="['_set_params','_update_simulation_params','_init_simulation','_run_steps','_play','_pause','_stop','_step_once','_playback_tick','_set_batch_size','_set_stats_interval','_get_stats_interval','_get_playback_state','_mark_carbon','_unmark_carbon','_finalize_carbon_placement','_get_lattice_data','_get_lattice','_get_lattice_size','_get_width','_get_height','_get_step','_get_wall_time','_get_time','_get_fill','_get_stats_json','_get_stats_json_len','_get_passivated','_get_terminated','_get_cell_coordination','_get_snapshot_count','_get_snapshot_step','_get_snapshot_lattice','_cleanup_simulation','_force_update_frontend']" -sEXPORTED_RUNTIME_METHODS="['ccall','cwrap','HEAP8','wasmMemory']"
  * Exported WASM stuff:
- *   _set_params(int Nx, int Ny, double d0, double T, double e0, double e1, double nu_f, double nu_d, int seed) 
- *   _update_simulation_params(double d0, double T, double nu_f, double nu_d, double nu_p, double e_pass, double e_c, double e0, double e1)
+ *   _set_params(int Nx, int Ny, double d0, double T, double e0, double e1, double e_c, double nu_f, double nu_d, double nu_p, double e_pass, double nu_dp, double e_dp, int seed)
+ *   _update_simulation_params(double d0, double T, double nu_f, double nu_d, double nu_p, double e_pass, double e_c, double e0, double e1, double nu_dp, double e_dp)
  *   _run_steps(int steps)
  *   _get_lattice_data()
  *   _get_width()
@@ -224,6 +224,11 @@ struct KMCParams
     // barriers here (~0.15-0.3 eV) -- 0.3 keeps passivation reachable
     // and occasionally competitive rather than mathematically
     // unreachable given nu_p's slider range.
+    double nu_dp = 1e5;  // de-passivation (SEI breakdown) attempt frequency
+    double e_dp = 0.5;   // eV — de-passivation activation energy barrier;
+    // higher than e_pass by default so passivation
+    // is the dominant direction unless tuned otherwise
+    // i love comments :]
     double kB = 8.617333262145e-5; // eV / K
     int max_steps = 400000;
     double max_time = 100.0;
@@ -427,6 +432,7 @@ struct Event
 {
     bool is_drop;
     bool is_passivation;
+    bool is_depassivation;
     int16_t sx, sy;
     int16_t dx, dy;
 };
@@ -446,6 +452,8 @@ struct StatsRow
     double total_rate;
     double e_pass_used;   // debug: the e_pass value active at this step
     double nu_p_used;     // debug: the nu_p value active at this step
+    double e_dp_used;     // debug: the e_dp value active at this step
+    double nu_dp_used;    // debug: the nu_dp value active at this step
 };
 
 // ---------------------------------------------------------------------------
@@ -469,16 +477,20 @@ class ElectrodepositionKMC
 {
 public:
     ~ElectrodepositionKMC() = default;
+    // Events per lattice site: 6 hop directions + 1 passivation + 1
+    // de-passivation (SEI breakdown, reverts PASSIVATED -> DEPOSITED).
+    static constexpr int kEventsPerSite = 8;
+
     explicit ElectrodepositionKMC(const KMCParams &p)
         : p_(p),
           rng_(p.pcg),
           lattice_(p.Ny * p.Nx, EMPTY),
           num_drop_(p.Nx),
-          num_hop_(p.Nx * p.Ny * 7),
-          max_events_(p.Nx + p.Nx * p.Ny * 7),
-          event_rates_(p.Nx + p.Nx * p.Ny * 7, 0.0),
-          ftree_(p.Nx + p.Nx * p.Ny * 7),
-          idx_to_event_(p.Nx + p.Nx * p.Ny * 7)
+          num_hop_(p.Nx * p.Ny * kEventsPerSite),
+          max_events_(p.Nx + p.Nx * p.Ny * kEventsPerSite),
+          event_rates_(p.Nx + p.Nx * p.Ny * kEventsPerSite, 0.0),
+          ftree_(p.Nx + p.Nx * p.Ny * kEventsPerSite),
+          idx_to_event_(p.Nx + p.Nx * p.Ny * kEventsPerSite)
     {
         // Validate.
         if (p_.Nx < 1)
@@ -731,6 +743,7 @@ private:
             {
                 true,
                 false,
+                false,
                 0,
                 0,
                 (int16_t)x,
@@ -742,7 +755,7 @@ private:
         {
             for (int x = 0; x < p_.Nx; ++x)
             {
-                int site_off = (y * p_.Nx + x) * 7;
+                int site_off = (y * p_.Nx + x) * kEventsPerSite;
                 for (int d = 0; d < 6; ++d)
                 {
                     int idx = base + site_off + d;
@@ -752,6 +765,7 @@ private:
 
                     idx_to_event_[idx] =
                     {
+                        false,
                         false,
                         false,
                         (int16_t)x,
@@ -766,6 +780,19 @@ private:
                 {
                     false,
                     true,
+                    false,
+                    (int16_t)x,
+                    (int16_t)y,
+                    0,
+                    0
+                };
+
+                // de-passivation (SEI breakdown) event
+                idx_to_event_[base + site_off + 7] =
+                {
+                    false,
+                    false,
+                    true,
                     (int16_t)x,
                     (int16_t)y,
                     0,
@@ -778,7 +805,7 @@ private:
     int drop_index(int x) const { return x; }
     int hop_base_index(int x, int y) const
     {
-        return num_drop_ + (y * p_.Nx + x) * 7;
+        return num_drop_ + (y * p_.Nx + x) * kEventsPerSite;
     }
 
     // -----------------------------------------------------------------------
@@ -879,6 +906,30 @@ private:
             double exposure_fraction = empty_neighbors / 6.0;
             return p_.nu_p *
                 exp(-p_.e_pass / (p_.kB * p_.T)) *
+                exposure_fraction;
+        }
+        // de-passivation (SEI breakdown) event -- reverts an exposed
+        // PASSIVATED atom back to DEPOSITED. Mirrors the passivation
+        // rate shape (same exposure-fraction weighting) but with its
+        // own independently-tunable frequency/barrier so growth and
+        // breakdown can be tuned separately.
+        if (ev.is_depassivation)
+        {
+            if (atype != PASSIVATED)
+                return 0.0;
+            bool exposed = false;
+            int empty_neighbors = 0;
+            for_each_neighbour(x0, y0, [&](int nx, int ny)
+                               {
+                if(at(nx,ny) == EMPTY) {
+                    exposed = true;
+                    empty_neighbors++;
+                } });
+            if (!exposed)
+                return 0.0;
+            double exposure_fraction = empty_neighbors / 6.0;
+            return p_.nu_dp *
+                exp(-p_.e_dp / (p_.kB * p_.T)) *
                 exposure_fraction;
         }
         if (atype != FREE && atype != DEPOSITED)
@@ -1017,7 +1068,7 @@ private:
             if (y == top_y)
                 update_rate_at(drop_index(x));
             int base = hop_base_index(x, y);
-            for (int d = 0; d < 7; ++d)
+            for (int d = 0; d < kEventsPerSite; ++d)
                 update_rate_at(base + d);
         }
     }
@@ -1176,6 +1227,14 @@ public:
                     step_directly_changed_.emplace_back(x0, y0);
                 }
             }
+            else if (ev.is_depassivation)
+            {
+                if (at(x0, y0) == PASSIVATED)
+                {
+                    at(x0, y0) = DEPOSITED;
+                    step_directly_changed_.emplace_back(x0, y0);
+                }
+            }
             else
             {
                 int x1 = wrap_x(ev.dx);
@@ -1221,7 +1280,9 @@ public:
         double e_pass,
         double e_c,
         double e0,
-        double e1
+        double e1,
+        double nu_dp,
+        double e_dp
     )
     {
         p_.d0 = d0;
@@ -1237,6 +1298,8 @@ public:
         p_.e_c = e_c;
         p_.e0 = e0;
         p_.e1 = e1;
+        p_.nu_dp = nu_dp;
+        p_.e_dp = std::max(e_dp, 0.05); // same floor rationale as e_pass
 
         // energy_lookup_ entries for CARBON depend on p_.e_c, so they must
         // be refreshed whenever e_c changes live -- not just the rate
@@ -1330,7 +1393,9 @@ public:
                 << "\"fill\":" << s.fill << ","
                 << "\"total_rate\":" << s.total_rate << ","
                 << "\"e_pass_used\":" << s.e_pass_used << ","
-                << "\"nu_p_used\":" << s.nu_p_used
+                << "\"nu_p_used\":" << s.nu_p_used << ","
+                << "\"e_dp_used\":" << s.e_dp_used << ","
+                << "\"nu_dp_used\":" << s.nu_dp_used
                 << "}";
 
             if(i + 1 < stats_history_.size())
@@ -1478,7 +1543,9 @@ private:
             fill_percentage(),
             total_rate,
             p_.e_pass,
-            p_.nu_p
+            p_.nu_p,
+            p_.e_dp,
+            p_.nu_dp
         });
 
         // Prevent unbounded memory growth on indefinite/very long runs:
@@ -1789,6 +1856,8 @@ extern "C"
         double nu_d,
         double nu_p,
         double e_pass,
+        double nu_dp,
+        double e_dp,
         int seed)
     {
         wasm_params.Nx = Nx;
@@ -1805,6 +1874,8 @@ extern "C"
         // Same floor as update_params(), applied here too since
         // set_params() is the other entry point that sets e_pass.
         wasm_params.e_pass = std::max(e_pass, 0.05);
+        wasm_params.nu_dp = nu_dp;
+        wasm_params.e_dp = std::max(e_dp, 0.05);
         wasm_params.rng_seed = seed;
 
         wasm_params.pcg.seed((uint64_t)seed);
@@ -1820,7 +1891,9 @@ extern "C"
         double e_pass,
         double e_c,
         double e0,
-        double e1
+        double e1,
+        double nu_dp,
+        double e_dp
     )
     {
         if (!wasm_sim)
@@ -1835,7 +1908,9 @@ extern "C"
             e_pass,
             e_c,
             e0,
-            e1
+            e1,
+            nu_dp,
+            e_dp
         );
     }
 
