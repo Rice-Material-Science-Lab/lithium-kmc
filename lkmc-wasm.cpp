@@ -1067,6 +1067,9 @@ public:
     // -----------------------------------------------------------------------
     bool execute_step()
     {
+        if (terminated_)
+            return false;
+
         if(parameters_changed_)
         {
             rebuild_all_rates();
@@ -1088,12 +1091,6 @@ public:
 
         if (r_tot <= 0.0)
         {
-            std::cerr 
-                << "\nKMC STOP: total event rate reached zero\n"
-                << "step=" << step_
-                << " time=" << time_
-                << "\n";
-
             int empty = 0;
             int free = 0;
             int deposited = 0;
@@ -1107,12 +1104,13 @@ public:
                 else if (v == PASSIVATED) passivated++;
             }
 
-            std::cerr
-                << "EMPTY=" << empty
-                << " FREE=" << free
-                << " DEPOSITED=" << deposited
-                << " PASSIVATED=" << passivated
-                << "\n";
+            // printf (stdout) instead of std::cerr (stderr) -- Emscripten's
+            // default glue code routes stderr straight to console.error,
+            // which is what was showing up as a JS console error.
+            printf(
+                "KMC STOP: total event rate reached zero step=%d time=%f EMPTY=%d FREE=%d DEPOSITED=%d PASSIVATED=%d\n",
+                step_, time_, empty, free, deposited, passivated
+            );
 
             terminated_ = true;
             return false;
