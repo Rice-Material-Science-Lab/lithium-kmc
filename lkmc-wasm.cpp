@@ -4,10 +4,10 @@
  * WASM version of C++ port of LKMC_v2_commented_b.py.
  *
  *  * Build:
- * emcc lkmc-wasm.cpp -o public/lkmc-wasm.js -O3 -fexceptions -sINITIAL_MEMORY=268435456 -sEXPORT_ES6 -sMODULARIZE -sEXPORTED_FUNCTIONS="['_set_params','_update_simulation_params','_save_state','_get_save_state_len','_load_state','_peek_state_dimensions','_init_simulation','_run_steps','_play','_pause','_stop','_step_once','_playback_tick','_set_batch_size','_set_stats_interval','_get_stats_interval','_get_playback_state','_mark_carbon','_unmark_carbon','_finalize_carbon_placement','_set_carbon_species_energy','_get_carbon_species_grid','_run_batch','_get_batch_json','_get_lattice_data','_get_lattice','_get_lattice_size','_get_width','_get_height','_get_step','_get_wall_time','_get_time','_get_fill','_get_stats_json','_get_stats_json_len','_get_passivated','_get_terminated','_get_cell_coordination','_get_snapshot_count','_get_snapshot_step','_get_snapshot_lattice','_cleanup_simulation','_force_update_frontend','_malloc','_free']" -sEXPORTED_RUNTIME_METHODS="['ccall','cwrap','HEAP8','HEAPU8','HEAP32','HEAPF64','wasmMemory']" -sEXPORTED_RUNTIME_METHODS="['ccall','cwrap','HEAP8','wasmMemory']"
+ * emcc lkmc-wasm.cpp -o public/lkmc-wasm.js -O3 -fexceptions -sINITIAL_MEMORY=268435456 -sEXPORT_ES6 -sMODULARIZE -sEXPORTED_FUNCTIONS="['_set_params','_update_simulation_params','_save_state','_get_save_state_len','_load_state','_peek_state_dimensions','_init_simulation','_run_steps','_play','_pause','_stop','_step_once','_playback_tick','_set_batch_size','_set_stats_interval','_get_stats_interval','_get_playback_state','_mark_carbon','_unmark_carbon','_finalize_carbon_placement','_set_carbon_species_energy','_get_carbon_species_grid','_run_batch','_get_batch_json','_get_lattice_data','_get_lattice','_get_lattice_size','_get_width','_get_height','_get_step','_get_wall_time','_get_time','_get_fill','_get_stats_json','_get_stats_json_len','_get_passivated','_get_terminated','_get_cell_coordination','_get_snapshot_count','_get_snapshot_step','_get_snapshot_lattice','_cleanup_simulation','_force_update_frontend','_malloc','_free']" -sEXPORTED_RUNTIME_METHODS="['ccall','cwrap','HEAP8','HEAPU8','HEAP32','HEAPF64','wasmMemory']" 
  * Exported WASM stuff:
- *   _set_params(int Nx, int Ny, double d0, double T, double e0, double e1, double e_c, double nu_f, double nu_d, double nu_p, double e_pass, double nu_dp, double e_dp, int seed)
- *   _update_simulation_params(double d0, double T, double nu_f, double nu_d, double nu_p, double e_pass, double e_c, double e0, double e1, double nu_dp, double e_dp)
+ *   _set_params(int Nx, int Ny, double d0, double T, double e0, double e1, double nu_f, double nu_d, double nu_p, double nu_dp, double e_dp, int seed)
+ *   _update_simulation_params(double d0, double T, double nu_f, double nu_d, double nu_p, double e0, double e1, double nu_dp, double e_dp)
  *   _run_steps(int steps)
  *   _get_lattice_data()
  *   _get_width()
@@ -226,12 +226,6 @@ struct KMCParams
     double nu_f = 5e7;
     double nu_d = 1e7;
     double nu_p = 1e6;
-    double e_pass = 0.3; // eV — passivation activation energy barrier
-    // Literature-cited SEI-forming decomposition barriers cluster
-    // around 0.3-0.5 eV, close to (not far above) typical surface hop
-    // barriers here (~0.15-0.3 eV) -- 0.3 keeps passivation reachable
-    // and occasionally competitive rather than mathematically
-    // unreachable given nu_p's slider range.
     double nu_dp = 1e5;  // de-passivation (SEI breakdown) attempt frequency
     double e_dp = 0.5;   // eV — de-passivation activation energy barrier;
     // higher than e_pass by default so passivation
@@ -458,7 +452,6 @@ struct StatsRow
     int substrate;
     double fill;
     double total_rate;
-    double e_pass_used;   // debug: the e_pass value active at this step
     double nu_p_used;     // debug: the nu_p value active at this step
     double e_dp_used;     // debug: the e_dp value active at this step
     double nu_dp_used;    // debug: the nu_dp value active at this step
@@ -964,9 +957,7 @@ private:
             // atom get up to 2x nu_p, silently doubling the effective
             // attempt frequency beyond what the slider implies).
             double exposure_fraction = empty_neighbors / 6.0;
-            return p_.nu_p *
-                exp(-p_.e_pass / (p_.kB * p_.T)) *
-                exposure_fraction;
+            return p_.nu_p * exposure_fraction;
         }
         // de-passivation (SEI breakdown) event -- reverts an exposed
         // PASSIVATED atom back to DEPOSITED. Mirrors the passivation
@@ -1337,7 +1328,6 @@ public:
         double nu_f,
         double nu_d,
         double nu_p,
-        double e_pass,
         double e0,
         double e1,
         double nu_dp,
@@ -1349,11 +1339,6 @@ public:
         p_.nu_f = nu_f;
         p_.nu_d = nu_d;
         p_.nu_p = nu_p;
-        // Floor at 0.05 eV: passivation should always carry some
-        // suppression relative to growth. Prevents a caller (or a future
-        // plumbing bug) from silently disabling the Boltzmann barrier by
-        // passing 0, which would let passivation dominate unrealistically.
-        p_.e_pass = std::max(e_pass, 0.05);
         p_.e0 = e0;
         p_.e1 = e1;
         p_.nu_dp = nu_dp;
@@ -1460,7 +1445,6 @@ public:
                 << "\"substrate\":" << s.substrate << ","
                 << "\"fill\":" << s.fill << ","
                 << "\"total_rate\":" << s.total_rate << ","
-                << "\"e_pass_used\":" << s.e_pass_used << ","
                 << "\"nu_p_used\":" << s.nu_p_used << ","
                 << "\"e_dp_used\":" << s.e_dp_used << ","
                 << "\"nu_dp_used\":" << s.nu_dp_used
@@ -1610,7 +1594,6 @@ private:
             substrate,
             fill_percentage(),
             total_rate,
-            p_.e_pass,
             p_.nu_p,
             p_.e_dp,
             p_.nu_dp
@@ -1923,7 +1906,6 @@ extern "C"
         double nu_f,
         double nu_d,
         double nu_p,
-        double e_pass,
         double nu_dp,
         double e_dp,
         int seed)
@@ -1938,9 +1920,6 @@ extern "C"
         wasm_params.nu_d = nu_d;
         // enable passivation
         wasm_params.nu_p = nu_p;
-        // Same floor as update_params(), applied here too since
-        // set_params() is the other entry point that sets e_pass.
-        wasm_params.e_pass = std::max(e_pass, 0.05);
         wasm_params.nu_dp = nu_dp;
         wasm_params.e_dp = std::max(e_dp, 0.05);
         wasm_params.rng_seed = seed;
@@ -1972,7 +1951,6 @@ extern "C"
         double nu_f,
         double nu_d,
         double nu_p,
-        double e_pass,
         double e0,
         double e1,
         double nu_dp,
@@ -1988,7 +1966,6 @@ extern "C"
             nu_f,
             nu_d,
             nu_p,
-            e_pass,
             e0,
             e1,
             nu_dp,
@@ -2368,11 +2345,7 @@ extern "C"
                 json << ",";
 
 #ifdef __EMSCRIPTEN__
-            EM_ASM({
-                if (typeof window.onBatchRunProgress === "function") {
-                    window.onBatchRunProgress($0, $1);
-                }
-            }, i + 1, num_runs);
+            notifyBatchProgress(i + 1, num_runs);
 #endif
         }
 
