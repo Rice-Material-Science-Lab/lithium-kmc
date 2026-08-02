@@ -954,8 +954,6 @@ private:
             // empty_neighbors ranges 0-6 on this hex lattice; divide by 6
             // so the exposure factor is a genuine 0-1 fraction instead of
             // occasionally exceeding 1.0 (the old /3.0 let a fully exposed
-            // atom get up to 2x nu_p, silently doubling the effective
-            // attempt frequency beyond what the slider implies).
             double exposure_fraction = empty_neighbors / 6.0;
             return p_.nu_p * exposure_fraction;
         }
