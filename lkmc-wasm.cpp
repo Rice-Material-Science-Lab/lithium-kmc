@@ -4,10 +4,10 @@
  * WASM version of C++ port of LKMC_v2_commented_b.py.
  *
  *  * Build:
- * emcc lkmc-wasm.cpp -o public/lkmc-wasm.js -O3 -fexceptions -sINITIAL_MEMORY=268435456 -sEXPORT_ES6 -sMODULARIZE -sEXPORTED_FUNCTIONS="['_set_params','_update_simulation_params','_init_simulation','_run_steps','_play','_pause','_stop','_step_once','_playback_tick','_set_batch_size','_set_stats_interval','_get_stats_interval','_get_playback_state','_mark_carbon','_unmark_carbon','_finalize_carbon_placement','_get_lattice_data','_get_lattice','_get_lattice_size','_get_width','_get_height','_get_step','_get_wall_time','_get_time','_get_fill','_get_stats_json','_get_stats_json_len','_get_passivated','_get_terminated','_cleanup_simulation','_force_update_frontend']" -sEXPORTED_RUNTIME_METHODS="['ccall','cwrap','HEAP8','wasmMemory']"
+ * emcc lkmc-wasm.cpp -o public/lkmc-wasm.js -O3 -fexceptions -sINITIAL_MEMORY=268435456 -sEXPORT_ES6 -sMODULARIZE -sEXPORTED_FUNCTIONS="['_set_params','_update_simulation_params','_save_state','_get_save_state_len','_load_state','_peek_state_dimensions','_init_simulation','_run_steps','_play','_pause','_stop','_step_once','_playback_tick','_set_batch_size','_set_stats_interval','_get_stats_interval','_get_playback_state','_mark_carbon','_unmark_carbon','_finalize_carbon_placement','_set_carbon_species_energy','_get_carbon_species_grid','_run_batch','_get_batch_json','_get_lattice_data','_get_lattice','_get_lattice_size','_get_width','_get_height','_get_step','_get_wall_time','_get_time','_get_fill','_get_stats_json','_get_stats_json_len','_get_passivated','_get_terminated','_get_cell_coordination','_get_snapshot_count','_get_snapshot_step','_get_snapshot_lattice','_cleanup_simulation','_force_update_frontend','_malloc','_free']" -sEXPORTED_RUNTIME_METHODS="['ccall','cwrap','HEAP8','HEAPU8','HEAP32','HEAPF64','wasmMemory']" 
  * Exported WASM stuff:
- *   _set_params(int Nx, int Ny, double d0, double T, double e0, double e1, double nu_f, double nu_d, int seed) 
- *   _update_simulation_params(double d0, double T, double nu_f, double nu_d, double nu_p, double e_pass, double e_c, double e0, double e1)
+ *   _set_params(int Nx, int Ny, double d0, double T, double e0, double e1, double nu_f, double nu_d, double nu_p, double nu_dp, double e_dp, int seed)
+ *   _update_simulation_params(double d0, double T, double nu_f, double nu_d, double nu_p, double e0, double e1, double nu_dp, double e_dp)
  *   _run_steps(int steps)
  *   _get_lattice_data()
  *   _get_width()
@@ -85,6 +85,13 @@ extern "C"
         if (typeof window.onSimulationTerminated === "function")
         {
             window.onSimulationTerminated();
+        }
+    });
+
+    EM_JS(void, notifyBatchProgress, (int done, int total), {
+        if (typeof window.onBatchRunProgress === "function")
+        {
+            window.onBatchRunProgress(done, total);
         }
     });
 }
@@ -182,6 +189,7 @@ constexpr int8_t DEPOSITED = 2;
 constexpr int8_t SUBSTRATE = 3;
 constexpr int8_t PASSIVATED = 4;
 constexpr int8_t CARBON = 5; // graphite anode site -- rigid, permanent, like SUBSTRATE
+constexpr int MAX_CARBON_SPECIES = 4;
 // ---------------------------------------------------------------------------
 // Hexagonal lattice neighbour offsets (odd-r horizontal layout)
 // ---------------------------------------------------------------------------
@@ -214,16 +222,15 @@ struct KMCParams
     double d0 = 1000.0;
     double e0 = -0.28;
     double e1 = -0.50;
-    double e_c = -0.6; // eV -- Li-C bond energy for graphite anode sites
+    double carbon_species_energy[MAX_CARBON_SPECIES] = {-0.6, -0.4, -0.8, -0.3}; // eV, per anode species
     double nu_f = 5e7;
     double nu_d = 1e7;
     double nu_p = 1e6;
-    double e_pass = 0.3; // eV — passivation activation energy barrier
-    // Literature-cited SEI-forming decomposition barriers cluster
-    // around 0.3-0.5 eV, close to (not far above) typical surface hop
-    // barriers here (~0.15-0.3 eV) -- 0.3 keeps passivation reachable
-    // and occasionally competitive rather than mathematically
-    // unreachable given nu_p's slider range.
+    double nu_dp = 1e5;  // de-passivation (SEI breakdown) attempt frequency
+    double e_dp = 0.5;   // eV — de-passivation activation energy barrier;
+    // higher than e_pass by default so passivation
+    // is the dominant direction unless tuned otherwise
+    // i love comments :]
     double kB = 8.617333262145e-5; // eV / K
     int max_steps = 400000;
     double max_time = 100.0;
@@ -427,6 +434,7 @@ struct Event
 {
     bool is_drop;
     bool is_passivation;
+    bool is_depassivation;
     int16_t sx, sy;
     int16_t dx, dy;
 };
@@ -444,8 +452,9 @@ struct StatsRow
     int substrate;
     double fill;
     double total_rate;
-    double e_pass_used;   // debug: the e_pass value active at this step
     double nu_p_used;     // debug: the nu_p value active at this step
+    double e_dp_used;     // debug: the e_dp value active at this step
+    double nu_dp_used;    // debug: the nu_dp value active at this step
 };
 
 // ---------------------------------------------------------------------------
@@ -469,16 +478,21 @@ class ElectrodepositionKMC
 {
 public:
     ~ElectrodepositionKMC() = default;
+    // Events per lattice site: 6 hop directions + 1 passivation + 1
+    // de-passivation (SEI breakdown, reverts PASSIVATED -> DEPOSITED).
+    static constexpr int kEventsPerSite = 8;
+
     explicit ElectrodepositionKMC(const KMCParams &p)
         : p_(p),
           rng_(p.pcg),
           lattice_(p.Ny * p.Nx, EMPTY),
+          carbon_species_((size_t)p.Nx * p.Ny, -1),
           num_drop_(p.Nx),
-          num_hop_(p.Nx * p.Ny * 7),
-          max_events_(p.Nx + p.Nx * p.Ny * 7),
-          event_rates_(p.Nx + p.Nx * p.Ny * 7, 0.0),
-          ftree_(p.Nx + p.Nx * p.Ny * 7),
-          idx_to_event_(p.Nx + p.Nx * p.Ny * 7)
+          num_hop_(p.Nx * p.Ny * kEventsPerSite),
+          max_events_(p.Nx + p.Nx * p.Ny * kEventsPerSite),
+          event_rates_(p.Nx + p.Nx * p.Ny * kEventsPerSite, 0.0),
+          ftree_(p.Nx + p.Nx * p.Ny * kEventsPerSite),
+          idx_to_event_(p.Nx + p.Nx * p.Ny * kEventsPerSite)
     {
         // Validate.
         if (p_.Nx < 1)
@@ -516,12 +530,6 @@ public:
         // Li-C bond energy: carbon interacts with FREE/DEPOSITED/PASSIVATED
         // atoms the same way SUBSTRATE does via e1, but with its own
         // independently-tunable e_c value.
-        energy_lookup_[FREE][CARBON] = p_.e_c;
-        energy_lookup_[CARBON][FREE] = p_.e_c;
-        energy_lookup_[DEPOSITED][CARBON] = p_.e_c;
-        energy_lookup_[CARBON][DEPOSITED] = p_.e_c;
-        energy_lookup_[PASSIVATED][CARBON] = p_.e_c;
-        energy_lookup_[CARBON][PASSIVATED] = p_.e_c;
 
 // Prepare output directory.
 #ifndef __EMSCRIPTEN__
@@ -631,6 +639,80 @@ public:
     int step() const { return step_; }
     bool is_terminated() const { return terminated_; }
     double time() const { return time_; }
+
+    // Public wrapper so the frontend can inspect a clicked cell without
+    // exposing the whole private energetics API.
+    int get_coordination_at(int x, int y) const
+    {
+        if (x < 0 || x >= p_.Nx || y < 0 || y >= p_.Ny)
+            return -1;
+        return coordination_number(x, y);
+    }
+
+    int snapshot_count() const
+    {
+        return (int)lattice_snapshots_.size();
+    }
+
+    int snapshot_step_at(int idx) const
+    {
+        if (idx < 0 || idx >= (int)lattice_snapshots_.size())
+            return -1;
+        return lattice_snapshots_[idx].step;
+    }
+
+    const int8_t *snapshot_lattice_at(int idx) const
+    {
+        if (idx < 0 || idx >= (int)lattice_snapshots_.size())
+            return nullptr;
+        return lattice_snapshots_[idx].data.data();
+    }
+    // Serializes everything needed to resume a run: dimensions, step/time,
+    // the raw lattice, and current params. Format is a flat buffer the
+    // frontend can base64/store and hand back later.
+    std::string serialize_state() const
+    {
+        std::ostringstream out(std::ios::binary);
+        auto write = [&](const void *ptr, size_t n) {
+            out.write(reinterpret_cast<const char *>(ptr), n);
+        };
+        int32_t nx = p_.Nx, ny = p_.Ny;
+        write(&nx, sizeof(nx));
+        write(&ny, sizeof(ny));
+        write(&step_, sizeof(step_));
+        write(&time_, sizeof(time_));
+        write(lattice_.data(), lattice_.size());
+        return out.str();
+    }
+
+    static bool deserialize_dimensions(const std::string &blob, int &nx, int &ny)
+    {
+        if (blob.size() < sizeof(int32_t) * 2)
+            return false;
+        memcpy(&nx, blob.data(), sizeof(int32_t));
+        memcpy(&ny, blob.data() + sizeof(int32_t), sizeof(int32_t));
+        return true;
+    }
+
+    // Restores lattice/step/time from a blob produced by serialize_state(),
+    // matching this instance's Nx/Ny (caller must construct with the right
+    // dimensions first via set_params + init_simulation).
+    bool restore_state(const std::string &blob)
+    {
+        size_t header = sizeof(int32_t) * 2 + sizeof(step_) + sizeof(time_);
+        if (blob.size() < header + lattice_.size())
+            return false;
+
+        size_t offset = sizeof(int32_t) * 2;
+        memcpy(&step_, blob.data() + offset, sizeof(step_));
+        offset += sizeof(step_);
+        memcpy(&time_, blob.data() + offset, sizeof(time_));
+        offset += sizeof(time_);
+        memcpy(lattice_.data(), blob.data() + offset, lattice_.size());
+
+        rebuild_all_rates();
+        return true;
+    }
     double wall_time() const
     {
         return std::chrono::duration<double>(
@@ -703,6 +785,7 @@ private:
             {
                 true,
                 false,
+                false,
                 0,
                 0,
                 (int16_t)x,
@@ -714,7 +797,7 @@ private:
         {
             for (int x = 0; x < p_.Nx; ++x)
             {
-                int site_off = (y * p_.Nx + x) * 7;
+                int site_off = (y * p_.Nx + x) * kEventsPerSite;
                 for (int d = 0; d < 6; ++d)
                 {
                     int idx = base + site_off + d;
@@ -724,6 +807,7 @@ private:
 
                     idx_to_event_[idx] =
                     {
+                        false,
                         false,
                         false,
                         (int16_t)x,
@@ -738,6 +822,19 @@ private:
                 {
                     false,
                     true,
+                    false,
+                    (int16_t)x,
+                    (int16_t)y,
+                    0,
+                    0
+                };
+
+                // de-passivation (SEI breakdown) event
+                idx_to_event_[base + site_off + 7] =
+                {
+                    false,
+                    false,
+                    true,
                     (int16_t)x,
                     (int16_t)y,
                     0,
@@ -750,12 +847,20 @@ private:
     int drop_index(int x) const { return x; }
     int hop_base_index(int x, int y) const
     {
-        return num_drop_ + (y * p_.Nx + x) * 7;
+        return num_drop_ + (y * p_.Nx + x) * kEventsPerSite;
     }
 
     // -----------------------------------------------------------------------
     // Energetics
     // -----------------------------------------------------------------------
+    double carbon_bond_energy_at(int nx, int ny) const
+    {
+        int8_t sp = carbon_species_[ny * p_.Nx + nx];
+        if (sp < 0 || sp >= MAX_CARBON_SPECIES)
+            sp = 0;
+        return p_.carbon_species_energy[sp];
+    }
+
     double calc_local_energy(int x, int y, int8_t atom_type) const
     {
         double e = 0.0;
@@ -769,7 +874,10 @@ private:
             if (n == DEPOSITED || n == PASSIVATED)
                 coord++;
 
-            e += energy_lookup_[atom_type][n];
+            if (n == CARBON)
+                e += carbon_bond_energy_at(nx, ny);
+            else
+                e += energy_lookup_[atom_type][n];
         });
 
         return e;
@@ -849,8 +957,30 @@ private:
             // atom get up to 2x nu_p, silently doubling the effective
             // attempt frequency beyond what the slider implies).
             double exposure_fraction = empty_neighbors / 6.0;
-            return p_.nu_p *
-                exp(-p_.e_pass / (p_.kB * p_.T)) *
+            return p_.nu_p * exposure_fraction;
+        }
+        // de-passivation (SEI breakdown) event -- reverts an exposed
+        // PASSIVATED atom back to DEPOSITED. Mirrors the passivation
+        // rate shape (same exposure-fraction weighting) but with its
+        // own independently-tunable frequency/barrier so growth and
+        // breakdown can be tuned separately.
+        if (ev.is_depassivation)
+        {
+            if (atype != PASSIVATED)
+                return 0.0;
+            bool exposed = false;
+            int empty_neighbors = 0;
+            for_each_neighbour(x0, y0, [&](int nx, int ny)
+                               {
+                if(at(nx,ny) == EMPTY) {
+                    exposed = true;
+                    empty_neighbors++;
+                } });
+            if (!exposed)
+                return 0.0;
+            double exposure_fraction = empty_neighbors / 6.0;
+            return p_.nu_dp *
+                exp(-p_.e_dp / (p_.kB * p_.T)) *
                 exposure_fraction;
         }
         if (atype != FREE && atype != DEPOSITED)
@@ -989,7 +1119,7 @@ private:
             if (y == top_y)
                 update_rate_at(drop_index(x));
             int base = hop_base_index(x, y);
-            for (int d = 0; d < 7; ++d)
+            for (int d = 0; d < kEventsPerSite; ++d)
                 update_rate_at(base + d);
         }
     }
@@ -1148,6 +1278,14 @@ public:
                     step_directly_changed_.emplace_back(x0, y0);
                 }
             }
+            else if (ev.is_depassivation)
+            {
+                if (at(x0, y0) == PASSIVATED)
+                {
+                    at(x0, y0) = DEPOSITED;
+                    step_directly_changed_.emplace_back(x0, y0);
+                }
+            }
             else
             {
                 int x1 = wrap_x(ev.dx);
@@ -1190,38 +1328,39 @@ public:
         double nu_f,
         double nu_d,
         double nu_p,
-        double e_pass,
-        double e_c,
         double e0,
-        double e1
+        double e1,
+        double nu_dp,
+        double e_dp
     )
     {
+        // Reject corrupted/non-finite input (e.g. from a stale WASM build
+        // mismatching this signature's arg count) rather than storing
+        // garbage that then dominates every rate calculation downstream.
+        if (!std::isfinite(d0) || !std::isfinite(T) || !std::isfinite(nu_f) ||
+            !std::isfinite(nu_d) || !std::isfinite(nu_p) || !std::isfinite(e0) ||
+            !std::isfinite(e1) || !std::isfinite(nu_dp) || !std::isfinite(e_dp))
+        {
+#ifndef __EMSCRIPTEN__
+            printf("REJECTED update_params: non-finite value in input\n");
+#endif
+            return;
+        }
+
         p_.d0 = d0;
         p_.T = T;
         p_.nu_f = nu_f;
         p_.nu_d = nu_d;
         p_.nu_p = nu_p;
-        // Floor at 0.05 eV: passivation should always carry some
-        // suppression relative to growth. Prevents a caller (or a future
-        // plumbing bug) from silently disabling the Boltzmann barrier by
-        // passing 0, which would let passivation dominate unrealistically.
-        p_.e_pass = std::max(e_pass, 0.05);
-        p_.e_c = e_c;
         p_.e0 = e0;
         p_.e1 = e1;
-
-        // energy_lookup_ entries for CARBON depend on p_.e_c, so they must
-        // be refreshed whenever e_c changes live -- not just the rate
-        // table (handled by parameters_changed_ below).
-        energy_lookup_[FREE][CARBON] = p_.e_c;
-        energy_lookup_[CARBON][FREE] = p_.e_c;
-        energy_lookup_[DEPOSITED][CARBON] = p_.e_c;
-        energy_lookup_[CARBON][DEPOSITED] = p_.e_c;
-        energy_lookup_[PASSIVATED][CARBON] = p_.e_c;
-        energy_lookup_[CARBON][PASSIVATED] = p_.e_c;
+        p_.nu_dp = nu_dp;
+        p_.e_dp = std::max(e_dp, 0.05); // same floor rationale as e_pass
 
         // energy_lookup_ entries that depend on p_.e0 / p_.e1 must also be
-        // refreshed live, same reasoning as CARBON above.
+        // refreshed live. CARBON energies are looked up per-cell via
+        // carbon_species_energy[] instead, and are set independently via
+        // set_carbon_species_energy().
         energy_lookup_[FREE][DEPOSITED] = p_.e0;
         energy_lookup_[DEPOSITED][FREE] = p_.e0;
         energy_lookup_[DEPOSITED][DEPOSITED] = p_.e0;
@@ -1258,11 +1397,13 @@ public:
     // each user-drawn carbon cell after init_simulation(), then call
     // finalize_carbon_placement() once at the end -- rebuilding the rate
     // table per-cell would be wasteful for a large drawn region.
-    void set_carbon_site(int x, int y)
+    void set_carbon_site(int x, int y, int species)
     {
         if (x < 0 || x >= p_.Nx || y < 0 || y >= p_.Ny)
             return;
         at(x, y) = CARBON;
+        int sp = std::max(0, std::min(species, MAX_CARBON_SPECIES - 1));
+        carbon_species_[y * p_.Nx + x] = (int8_t)sp;
     }
 
     // Reverts a cell that was previously marked carbon back to EMPTY.
@@ -1274,18 +1415,41 @@ public:
         if (x < 0 || x >= p_.Nx || y < 0 || y >= p_.Ny)
             return;
         if (at(x, y) == CARBON)
+        {
             at(x, y) = EMPTY;
+            carbon_species_[y * p_.Nx + x] = -1;
+        }
+    }
+
+    void set_carbon_species_energy(int species, double energy)
+    {
+        if (species < 0 || species >= MAX_CARBON_SPECIES)
+            return;
+        p_.carbon_species_energy[species] = energy;
+        parameters_changed_ = true;
+    }
+
+    const int8_t *carbon_species_data() const
+    {
+        return carbon_species_.data();
     }
 
     void finalize_carbon_placement()
     {
         rebuild_all_rates();
     }
+    // Guarantees a JSON-safe number token -- never emits nan/inf, which
+    // are invalid JSON and break JSON.parse on the frontend.
+    static double json_safe(double v)
+    {
+        return std::isfinite(v) ? v : 0.0;
+    }
+
     std::string get_stats_json() const
     {
         std::ostringstream json;
 
-        json << "[";
+        json << "[";    
 
         for(size_t i = 0; i < stats_history_.size(); i++)
         {
@@ -1300,9 +1464,10 @@ public:
                 << "\"passivated\":" << s.passivated << ","
                 << "\"substrate\":" << s.substrate << ","
                 << "\"fill\":" << s.fill << ","
-                << "\"total_rate\":" << s.total_rate << ","
-                << "\"e_pass_used\":" << s.e_pass_used << ","
-                << "\"nu_p_used\":" << s.nu_p_used
+                << "\"total_rate\":" << json_safe(s.total_rate) << ","
+                << "\"nu_p_used\":" << json_safe(s.nu_p_used) << ","
+                << "\"e_dp_used\":" << json_safe(s.e_dp_used) << ","
+                << "\"nu_dp_used\":" << json_safe(s.nu_dp_used)
                 << "}";
 
             if(i + 1 < stats_history_.size())
@@ -1449,8 +1614,9 @@ private:
             substrate,
             fill_percentage(),
             total_rate,
-            p_.e_pass,
-            p_.nu_p
+            p_.nu_p,
+            p_.e_dp,
+            p_.nu_dp
         });
 
         // Prevent unbounded memory growth on indefinite/very long runs:
@@ -1465,6 +1631,20 @@ private:
                 compacted.push_back(stats_history_[i]);
             stats_history_.swap(compacted);
             stats_interval_ *= 2;
+        }
+
+        // Snapshot the full lattice at the same cadence as stats, so the
+        // frontend can scrub back through history rather than only seeing
+        // the live state. Bounded the same way -- halve and keep going
+        // once the cap is hit.
+        lattice_snapshots_.push_back({step_, time_, lattice_});
+        if (lattice_snapshots_.size() > kMaxLatticeSnapshots)
+        {
+            std::vector<LatticeSnapshot> compacted;
+            compacted.reserve(lattice_snapshots_.size() / 2 + 1);
+            for (size_t i = 0; i < lattice_snapshots_.size(); i += 2)
+                compacted.push_back(std::move(lattice_snapshots_[i]));
+            lattice_snapshots_.swap(compacted);
         }
     }
 
@@ -1665,6 +1845,7 @@ private:
     std::chrono::steady_clock::time_point wall_start_;
 
     std::vector<int8_t> lattice_; // [y*Nx + x]
+    std::vector<int8_t> carbon_species_; // [y*Nx + x], -1 = not carbon
     double energy_lookup_[6][6];
     int num_drop_;
     int num_hop_;
@@ -1690,6 +1871,15 @@ private:
     std::vector<std::pair<int, int>> step_all_changed_;
 
     static constexpr size_t kMaxStatsRows = 5000;
+    static constexpr size_t kMaxLatticeSnapshots = 300;
+
+    struct LatticeSnapshot
+    {
+        int step;
+        double time;
+        std::vector<int8_t> data;
+    };
+    std::vector<LatticeSnapshot> lattice_snapshots_;
 
     double time_ = 0.0;
     int step_ = 0;
@@ -1733,30 +1923,55 @@ extern "C"
         double T,
         double e0,
         double e1,
-        double e_c,
         double nu_f,
         double nu_d,
         double nu_p,
-        double e_pass,
+        double nu_dp,
+        double e_dp,
         int seed)
     {
+        if (!std::isfinite(d0) || !std::isfinite(T) || !std::isfinite(e0) ||
+            !std::isfinite(e1) || !std::isfinite(nu_f) || !std::isfinite(nu_d) ||
+            !std::isfinite(nu_p) || !std::isfinite(nu_dp) || !std::isfinite(e_dp))
+        {
+#ifndef __EMSCRIPTEN__
+            printf("REJECTED set_params: non-finite value in input\n");
+#endif
+            return;
+        }
+
         wasm_params.Nx = Nx;
         wasm_params.Ny = Ny;
         wasm_params.d0 = d0;
         wasm_params.T = T;
         wasm_params.e0 = e0;
         wasm_params.e1 = e1;
-        wasm_params.e_c = e_c;
         wasm_params.nu_f = nu_f;
         wasm_params.nu_d = nu_d;
         // enable passivation
         wasm_params.nu_p = nu_p;
-        // Same floor as update_params(), applied here too since
-        // set_params() is the other entry point that sets e_pass.
-        wasm_params.e_pass = std::max(e_pass, 0.05);
+        wasm_params.nu_dp = nu_dp;
+        wasm_params.e_dp = std::max(e_dp, 0.05);
         wasm_params.rng_seed = seed;
 
         wasm_params.pcg.seed((uint64_t)seed);
+    }
+
+    EMSCRIPTEN_KEEPALIVE
+    void set_carbon_species_energy(int species, double energy)
+    {
+        // Applies to whatever's currently active: the running sim if one
+        // exists, and wasm_params so a fresh init_simulation() picks it up.
+        if (species >= 0 && species < MAX_CARBON_SPECIES)
+            wasm_params.carbon_species_energy[species] = energy;
+        if (wasm_sim)
+            wasm_sim->set_carbon_species_energy(species, energy);
+    }
+
+    EMSCRIPTEN_KEEPALIVE
+    const int8_t *get_carbon_species_grid()
+    {
+        return wasm_sim ? wasm_sim->carbon_species_data() : nullptr;
     }
 
     EMSCRIPTEN_KEEPALIVE
@@ -1766,10 +1981,10 @@ extern "C"
         double nu_f,
         double nu_d,
         double nu_p,
-        double e_pass,
-        double e_c,
         double e0,
-        double e1
+        double e1,
+        double nu_dp,
+        double e_dp
     )
     {
         if (!wasm_sim)
@@ -1781,10 +1996,10 @@ extern "C"
             nu_f,
             nu_d,
             nu_p,
-            e_pass,
-            e_c,
             e0,
-            e1
+            e1,
+            nu_dp,
+            e_dp
         );
     }
 
@@ -1802,10 +2017,10 @@ extern "C"
     }
 
     EMSCRIPTEN_KEEPALIVE
-    void mark_carbon(int x, int y)
+    void mark_carbon(int x, int y, int species)
     {
         if (wasm_sim)
-            wasm_sim->set_carbon_site(x, y);
+            wasm_sim->set_carbon_site(x, y, species);
     }
 
     EMSCRIPTEN_KEEPALIVE
@@ -2029,6 +2244,149 @@ extern "C"
     int get_terminated()
     {
         return (wasm_sim && wasm_sim->is_terminated()) ? 1 : 0;
+    }
+
+    EMSCRIPTEN_KEEPALIVE
+    int get_cell_coordination(int x, int y)
+    {
+        return wasm_sim ? wasm_sim->get_coordination_at(x, y) : -1;
+    }
+
+    EMSCRIPTEN_KEEPALIVE
+    int get_snapshot_count()
+    {
+        return wasm_sim ? wasm_sim->snapshot_count() : 0;
+    }
+
+    EMSCRIPTEN_KEEPALIVE
+    int get_snapshot_step(int idx)
+    {
+        return wasm_sim ? wasm_sim->snapshot_step_at(idx) : -1;
+    }
+
+    EMSCRIPTEN_KEEPALIVE
+    const int8_t *get_snapshot_lattice(int idx)
+    {
+        return wasm_sim ? wasm_sim->snapshot_lattice_at(idx) : nullptr;
+    }
+    
+    static std::string g_save_state_buf;
+
+    EMSCRIPTEN_KEEPALIVE
+    const char *save_state()
+    {
+        if (!wasm_sim)
+        {
+            g_save_state_buf.clear();
+            return g_save_state_buf.c_str();
+        }
+        g_save_state_buf = wasm_sim->serialize_state();
+        return g_save_state_buf.c_str();
+    }
+
+    EMSCRIPTEN_KEEPALIVE
+    int get_save_state_len()
+    {
+        return (int)g_save_state_buf.size();
+    }
+
+    // Caller must have already called set_params (with matching Nx/Ny read
+    // from the blob) and init_simulation before calling this.
+    EMSCRIPTEN_KEEPALIVE
+    int load_state(const char *data, int len)
+    {
+        if (!wasm_sim || !data || len <= 0)
+            return 0;
+        std::string blob(data, len);
+        return wasm_sim->restore_state(blob) ? 1 : 0;
+    }
+
+    EMSCRIPTEN_KEEPALIVE
+    int peek_state_dimensions(const char *data, int len, int *out_nx, int *out_ny)
+    {
+        if (!data || len <= 0)
+            return 0;
+        std::string blob(data, len);
+        int nx = 0, ny = 0;
+        if (!ElectrodepositionKMC::deserialize_dimensions(blob, nx, ny))
+            return 0;
+        if (out_nx) *out_nx = nx;
+        if (out_ny) *out_ny = ny;
+        return 1;
+    }
+
+    static std::string g_batch_json_buf;
+
+    EMSCRIPTEN_KEEPALIVE
+    void run_batch(
+        double *d0_arr,
+        double *T_arr,
+        double *e0_arr,
+        double *e1_arr,
+        int num_runs,
+        int nx,
+        int ny,
+        int steps_per_run,
+        int base_seed)
+    {
+        std::ostringstream json;
+        json << "[";
+
+        for (int i = 0; i < num_runs; i++)
+        {
+            KMCParams p = wasm_params; // inherit current defaults (carbon energies, etc.)
+            p.Nx = nx;
+            p.Ny = ny;
+            p.d0 = d0_arr[i];
+            p.T = T_arr[i];
+            p.e0 = e0_arr[i];
+            p.e1 = e1_arr[i];
+            p.rng_seed = base_seed + i;
+            p.pcg.seed((uint64_t)p.rng_seed);
+
+            auto t0 = std::chrono::steady_clock::now();
+            ElectrodepositionKMC sim(p);
+            int actual_steps = 0;
+            for (int s = 0; s < steps_per_run; s++)
+            {
+                if (!sim.execute_step())
+                    break;
+                actual_steps++;
+            }
+            double wall = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - t0
+            ).count();
+
+            json << "{"
+                 << "\"index\":" << i << ","
+                 << "\"d0\":" << p.d0 << ","
+                 << "\"T\":" << p.T << ","
+                 << "\"e0\":" << p.e0 << ","
+                 << "\"e1\":" << p.e1 << ","
+                 << "\"steps_run\":" << actual_steps << ","
+                 << "\"final_step\":" << sim.step() << ","
+                 << "\"final_time\":" << sim.time() << ","
+                 << "\"fill_pct\":" << sim.fill_percentage() << ","
+                 << "\"passivated\":" << sim.passivated_count() << ","
+                 << "\"terminated\":" << (sim.is_terminated() ? 1 : 0) << ","
+                 << "\"wall_time\":" << wall
+                 << "}";
+            if (i + 1 < num_runs)
+                json << ",";
+
+#ifdef __EMSCRIPTEN__
+            notifyBatchProgress(i + 1, num_runs);
+#endif
+        }
+
+        json << "]";
+        g_batch_json_buf = json.str();
+    }
+
+    EMSCRIPTEN_KEEPALIVE
+    const char *get_batch_json()
+    {
+        return g_batch_json_buf.c_str();
     }
 
     EMSCRIPTEN_KEEPALIVE
