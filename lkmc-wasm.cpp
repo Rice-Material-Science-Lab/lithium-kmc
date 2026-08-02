@@ -1334,6 +1334,19 @@ public:
         double e_dp
     )
     {
+        // Reject corrupted/non-finite input (e.g. from a stale WASM build
+        // mismatching this signature's arg count) rather than storing
+        // garbage that then dominates every rate calculation downstream.
+        if (!std::isfinite(d0) || !std::isfinite(T) || !std::isfinite(nu_f) ||
+            !std::isfinite(nu_d) || !std::isfinite(nu_p) || !std::isfinite(e0) ||
+            !std::isfinite(e1) || !std::isfinite(nu_dp) || !std::isfinite(e_dp))
+        {
+#ifndef __EMSCRIPTEN__
+            printf("REJECTED update_params: non-finite value in input\n");
+#endif
+            return;
+        }
+
         p_.d0 = d0;
         p_.T = T;
         p_.nu_f = nu_f;
@@ -1425,11 +1438,18 @@ public:
     {
         rebuild_all_rates();
     }
+    // Guarantees a JSON-safe number token -- never emits nan/inf, which
+    // are invalid JSON and break JSON.parse on the frontend.
+    static double json_safe(double v)
+    {
+        return std::isfinite(v) ? v : 0.0;
+    }
+
     std::string get_stats_json() const
     {
         std::ostringstream json;
 
-        json << "[";
+        json << "[";    
 
         for(size_t i = 0; i < stats_history_.size(); i++)
         {
@@ -1444,10 +1464,10 @@ public:
                 << "\"passivated\":" << s.passivated << ","
                 << "\"substrate\":" << s.substrate << ","
                 << "\"fill\":" << s.fill << ","
-                << "\"total_rate\":" << s.total_rate << ","
-                << "\"nu_p_used\":" << s.nu_p_used << ","
-                << "\"e_dp_used\":" << s.e_dp_used << ","
-                << "\"nu_dp_used\":" << s.nu_dp_used
+                << "\"total_rate\":" << json_safe(s.total_rate) << ","
+                << "\"nu_p_used\":" << json_safe(s.nu_p_used) << ","
+                << "\"e_dp_used\":" << json_safe(s.e_dp_used) << ","
+                << "\"nu_dp_used\":" << json_safe(s.nu_dp_used)
                 << "}";
 
             if(i + 1 < stats_history_.size())
@@ -1910,6 +1930,16 @@ extern "C"
         double e_dp,
         int seed)
     {
+        if (!std::isfinite(d0) || !std::isfinite(T) || !std::isfinite(e0) ||
+            !std::isfinite(e1) || !std::isfinite(nu_f) || !std::isfinite(nu_d) ||
+            !std::isfinite(nu_p) || !std::isfinite(nu_dp) || !std::isfinite(e_dp))
+        {
+#ifndef __EMSCRIPTEN__
+            printf("REJECTED set_params: non-finite value in input\n");
+#endif
+            return;
+        }
+
         wasm_params.Nx = Nx;
         wasm_params.Ny = Ny;
         wasm_params.d0 = d0;
