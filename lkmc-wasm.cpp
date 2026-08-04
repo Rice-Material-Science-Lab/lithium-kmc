@@ -945,13 +945,17 @@ private:
             // Passivation only occurs on exposed deposited atoms
             bool exposed = false;
             int empty_neighbors = 0;
+            int passivated_neighbors = 0;
             for_each_neighbour(x0, y0, [&](int nx, int ny)
                                {
-                if(at(nx,ny) == EMPTY) {
+                int8_t n = at(nx, ny);
+                if(n == EMPTY) {
                     exposed = true;
                     empty_neighbors++;
+                }
+                if(n == PASSIVATED) {
+                    passivated_neighbors++;
                 } });
-            int coord = coordination_number(x0,y0);
             if (!exposed)
                 return 0.0;
             // Apply the same Boltzmann suppression as hop/drop events so
@@ -961,8 +965,23 @@ private:
             // so the exposure factor is a genuine 0-1 fraction instead of
             // occasionally exceeding 1.0 (the old /3.0 let a fully exposed
             double exposure_fraction = empty_neighbors / 6.0;
+
+            // Self-limiting SEI growth: real SEI formation is
+            // diffusion-limited once a passivation layer already exists
+            // nearby (Peled's SEI model -- roughly parabolic/sqrt(t)
+            // growth, not unbounded). Model this as an extra activation
+            // barrier per already-passivated neighbor: a bare exposed
+            // atom still passivates readily (an initial monolayer forms
+            // fast, matching how real SEI forms within seconds of
+            // electrolyte contact), but further growth into an
+            // already-coated region is exponentially suppressed instead
+            // of running away to cover the whole lattice.
+            static constexpr double kSeiGrowthBarrier = 0.15; // eV/neighbor
+            double local_barrier =
+                p_.e_pass + kSeiGrowthBarrier * passivated_neighbors;
+
             return p_.nu_p *
-                exp(-p_.e_pass / (p_.kB * p_.T)) *
+                exp(-local_barrier / (p_.kB * p_.T)) *
                 exposure_fraction;
         }
         // de-passivation (SEI breakdown) event, reverts an exposed
