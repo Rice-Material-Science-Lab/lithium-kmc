@@ -2343,20 +2343,37 @@ extern "C"
         int nx,
         int ny,
         int steps_per_run,
-        int base_seed)
+        int base_seed,
+        double nu_f,
+        double nu_d,
+        double nu_p,
+        double e_pass,
+        double nu_dp,
+        double e_dp)
     {
         std::ostringstream json;
         json << "[";
 
         for (int i = 0; i < num_runs; i++)
         {
-            KMCParams p = wasm_params; // inherit current defaults (carbon energies, etc.)
+            KMCParams p = wasm_params; // inherit carbon energies, etc.
             p.Nx = nx;
             p.Ny = ny;
             p.d0 = d0_arr[i];
             p.T = T_arr[i];
             p.e0 = e0_arr[i];
             p.e1 = e1_arr[i];
+            // Previously these came only from wasm_params (last set_params()
+            // call, i.e. the last time the main Run button was pressed) --
+            // meaning Batch Run silently ignored the current hop/passivation
+            // sliders unless you'd just run the main sim with matching
+            // values. Now explicit, same as set_params/update_params.
+            p.nu_f = nu_f;
+            p.nu_d = nu_d;
+            p.nu_p = nu_p;
+            p.e_pass = std::max(e_pass, 0.05);
+            p.nu_dp = nu_dp;
+            p.e_dp = std::max(e_dp, 0.05);
             p.rng_seed = base_seed + i;
             p.pcg.seed((uint64_t)p.rng_seed);
 
