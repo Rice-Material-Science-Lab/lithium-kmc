@@ -4,7 +4,14 @@
  * WASM version of C++ port of LKMC_v2_commented_b.py.
  *
  *  * Build:
- * emcc lkmc-wasm.cpp -o public/lkmc-wasm.js -O3 -fexceptions -sINITIAL_MEMORY=268435456 -sEXPORT_ES6 -sMODULARIZE -sEXPORTED_FUNCTIONS="['_set_params','_update_simulation_params','_save_state','_get_save_state_len','_load_state','_peek_state_dimensions','_init_simulation','_run_steps','_play','_pause','_stop','_step_once','_playback_tick','_set_batch_size','_set_stats_interval','_get_stats_interval','_get_playback_state','_mark_carbon','_unmark_carbon','_finalize_carbon_placement','_set_carbon_species_energy','_get_carbon_species_grid','_run_batch','_get_batch_json','_get_lattice_data','_get_lattice','_get_lattice_size','_get_width','_get_height','_get_step','_get_wall_time','_get_time','_get_fill','_get_stats_json','_get_stats_json_len','_get_passivated','_get_terminated','_get_cell_coordination','_get_snapshot_count','_get_snapshot_step','_get_snapshot_lattice','_cleanup_simulation','_force_update_frontend','_malloc','_free']" -sEXPORTED_RUNTIME_METHODS="['ccall','cwrap','HEAP8','HEAPU8','HEAP32','HEAPF64','wasmMemory']" 
+ * em++ lkmc-wasm.cpp -o public/lkmc-wasm.js \
+  -O3 -std=c++17 -fexceptions \
+  -sINITIAL_MEMORY=268435456 \
+  -sALLOW_MEMORY_GROWTH=1 \
+  -sEXPORT_ES6=1 -sMODULARIZE=1 \
+  -sEXPORTED_FUNCTIONS='["_set_params","_set_carbon_species_energy","_get_carbon_species_grid","_update_simulation_params","_init_simulation","_mark_carbon","_unmark_carbon","_finalize_carbon_placement","_run_steps","_get_lattice_data","_get_width","_get_stats_json","_get_stats_json_len","_get_height","_get_lattice","_get_lattice_size","_get_fill","_get_passivated","_get_step","_get_time","_get_wall_time","_play","_pause","_stop","_step_once","_playback_tick","_set_batch_size","_set_stats_interval","_get_stats_interval","_get_playback_state","_get_terminated","_get_cell_coordination","_get_snapshot_count","_get_snapshot_step","_get_snapshot_lattice","_save_state","_get_save_state_len","_load_state","_peek_state_dimensions","_run_batch","_get_batch_json","_cleanup_simulation","_force_update_frontend"]' \
+  -sEXPORTED_RUNTIME_METHODS='["ccall","cwrap"]' \
+  -sALLOW_TABLE_GROWTH=1
  * Exported WASM stuff:
  *   _set_params(int Nx, int Ny, double d0, double T, double e0, double e1, double nu_f, double nu_d, double nu_p, double e_pass, double nu_dp, double e_dp, int seed)
  *   _update_simulation_params(double d0, double T, double nu_f, double nu_d, double nu_p, double e_pass, double e0, double e1, double nu_dp, double e_dp)
