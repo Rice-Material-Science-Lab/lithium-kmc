@@ -2036,7 +2036,15 @@ extern "C"
             wasm_sim = nullptr;
         }
 
-        wasm_sim = new ElectrodepositionKMC(wasm_params);
+        try
+        {
+            wasm_sim = new ElectrodepositionKMC(wasm_params);
+        }
+        catch (const std::exception &e)
+        {
+            printf("CRITICAL ERROR: init_simulation failed: %s\n", e.what());
+            wasm_sim = nullptr;
+        }
     }
 
     EMSCRIPTEN_KEEPALIVE
@@ -2385,32 +2393,53 @@ extern "C"
             p.pcg.seed((uint64_t)p.rng_seed);
 
             auto t0 = std::chrono::steady_clock::now();
-            ElectrodepositionKMC sim(p);
-            int actual_steps = 0;
-            for (int s = 0; s < steps_per_run; s++)
+            try
             {
-                if (!sim.execute_step())
-                    break;
-                actual_steps++;
-            }
-            double wall = std::chrono::duration<double>(
-                std::chrono::steady_clock::now() - t0
-            ).count();
+                ElectrodepositionKMC sim(p);
+                int actual_steps = 0;
+                for (int s = 0; s < steps_per_run; s++)
+                {
+                    if (!sim.execute_step())
+                        break;
+                    actual_steps++;
+                }
+                double wall = std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - t0
+                ).count();
 
-            json << "{"
-                 << "\"index\":" << i << ","
-                 << "\"d0\":" << p.d0 << ","
-                 << "\"T\":" << p.T << ","
-                 << "\"e0\":" << p.e0 << ","
-                 << "\"e1\":" << p.e1 << ","
-                 << "\"steps_run\":" << actual_steps << ","
-                 << "\"final_step\":" << sim.step() << ","
-                 << "\"final_time\":" << sim.time() << ","
-                 << "\"fill_pct\":" << sim.fill_percentage() << ","
-                 << "\"passivated\":" << sim.passivated_count() << ","
-                 << "\"terminated\":" << (sim.is_terminated() ? 1 : 0) << ","
-                 << "\"wall_time\":" << wall
-                 << "}";
+                json << "{"
+                     << "\"index\":" << i << ","
+                     << "\"d0\":" << p.d0 << ","
+                     << "\"T\":" << p.T << ","
+                     << "\"e0\":" << p.e0 << ","
+                     << "\"e1\":" << p.e1 << ","
+                     << "\"steps_run\":" << actual_steps << ","
+                     << "\"final_step\":" << sim.step() << ","
+                     << "\"final_time\":" << sim.time() << ","
+                     << "\"fill_pct\":" << sim.fill_percentage() << ","
+                     << "\"passivated\":" << sim.passivated_count() << ","
+                     << "\"terminated\":" << (sim.is_terminated() ? 1 : 0) << ","
+                     << "\"wall_time\":" << wall
+                     << "}";
+            }
+            catch (const std::exception &e)
+            {
+                printf("run_batch: run %d failed (%s), skipping\n", i, e.what());
+                json << "{"
+                     << "\"index\":" << i << ","
+                     << "\"d0\":" << p.d0 << ","
+                     << "\"T\":" << p.T << ","
+                     << "\"e0\":" << p.e0 << ","
+                     << "\"e1\":" << p.e1 << ","
+                     << "\"steps_run\":0,"
+                     << "\"final_step\":0,"
+                     << "\"final_time\":0,"
+                     << "\"fill_pct\":0,"
+                     << "\"passivated\":0,"
+                     << "\"terminated\":1,"
+                     << "\"wall_time\":0"
+                     << "}";
+            }
             if (i + 1 < num_runs)
                 json << ",";
 
