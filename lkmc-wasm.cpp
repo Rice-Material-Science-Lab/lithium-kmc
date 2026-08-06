@@ -4,14 +4,7 @@
  * WASM version of C++ port of LKMC_v2_commented_b.py.
  *
  *  * Build:
- * em++ lkmc-wasm.cpp -o public/lkmc-wasm.js \
-  -O3 -std=c++17 -fexceptions \
-  -sINITIAL_MEMORY=268435456 \
-  -sALLOW_MEMORY_GROWTH=1 \
-  -sEXPORT_ES6=1 -sMODULARIZE=1 \
-  -sEXPORTED_FUNCTIONS='["_set_params","_set_carbon_species_energy","_get_carbon_species_grid","_update_simulation_params","_init_simulation","_mark_carbon","_unmark_carbon","_finalize_carbon_placement","_run_steps","_get_lattice_data","_get_width","_get_stats_json","_get_stats_json_len","_get_height","_get_lattice","_get_lattice_size","_get_fill","_get_passivated","_get_step","_get_time","_get_wall_time","_play","_pause","_stop","_step_once","_playback_tick","_set_batch_size","_set_stats_interval","_get_stats_interval","_get_playback_state","_get_terminated","_get_cell_coordination","_get_snapshot_count","_get_snapshot_step","_get_snapshot_lattice","_save_state","_get_save_state_len","_load_state","_peek_state_dimensions","_run_batch","_get_batch_json","_cleanup_simulation","_force_update_frontend","_malloc","_free"]' \
-  -sEXPORTED_RUNTIME_METHODS='["ccall","cwrap","HEAP8","HEAPU8","HEAP32","HEAPF64","wasmMemory"]' \
-  -sALLOW_TABLE_GROWTH=1
+ * em++ lkmc-wasm.cpp -o public/lkmc-wasm.js -O3 -std=c++17 -fexceptions -sINITIAL_MEMORY=268435456 -sALLOW_MEMORY_GROWTH=1 -sEXPORT_ES6=1 -sMODULARIZE=1 -sEXPORTED_FUNCTIONS="['_set_params','_set_carbon_species_energy','_get_carbon_species_grid','_update_simulation_params','_init_simulation','_mark_carbon','_unmark_carbon','_finalize_carbon_placement','_run_steps','_get_lattice_data','_get_width','_get_stats_json','_get_stats_json_len','_get_height','_get_lattice','_get_lattice_size','_get_fill','_get_passivated','_get_step','_get_time','_get_wall_time','_play','_pause','_stop','_step_once','_playback_tick','_set_batch_size','_set_stats_interval','_get_stats_interval','_get_playback_state','_get_terminated','_get_cell_coordination','_get_snapshot_count','_get_snapshot_step','_get_snapshot_lattice','_save_state','_get_save_state_len','_load_state','_peek_state_dimensions','_run_batch','_run_batch_begin','_run_batch_single','_run_batch_end','_get_batch_json','_cleanup_simulation','_force_update_frontend','_malloc','_free']" -sEXPORTED_RUNTIME_METHODS="['ccall','cwrap','HEAP8','HEAPU8','HEAP32','HEAPF64','wasmMemory']" -sALLOW_TABLE_GROWTH=1
  * Exported WASM stuff:
  *   _set_params(int Nx, int Ny, double d0, double T, double e0, double e1, double nu_f, double nu_d, double nu_p, double e_pass, double nu_dp, double e_dp, int seed)
  *   _update_simulation_params(double d0, double T, double nu_f, double nu_d, double nu_p, double e_pass, double e0, double e1, double nu_dp, double e_dp)
@@ -2346,7 +2339,117 @@ extern "C"
         return 1;
     }
 
+
     static std::string g_batch_json_buf;
+    static bool g_batch_first_entry = true;
+
+    // Per-run entry point: no pointer/array arguments, so no _malloc/_free
+    // needed on the JS side. Call this once per sweep point from JS, then
+    // run_batch_end() to close the JSON array.
+    EMSCRIPTEN_KEEPALIVE
+    void run_batch_begin()
+    {
+        g_batch_json_buf = "[";
+        g_batch_first_entry = true;
+    }
+
+    EMSCRIPTEN_KEEPALIVE
+    void run_batch_single(
+        int index,
+        double d0,
+        double T,
+        double e0,
+        double e1,
+        int nx,
+        int ny,
+        int steps_per_run,
+        int seed,
+        double nu_f,
+        double nu_d,
+        double nu_p,
+        double e_pass,
+        double nu_dp,
+        double e_dp)
+    {
+        KMCParams p = wasm_params; // inherit carbon energies, etc.
+        p.Nx = nx;
+        p.Ny = ny;
+        p.d0 = d0;
+        p.T = T;
+        p.e0 = e0;
+        p.e1 = e1;
+        p.nu_f = nu_f;
+        p.nu_d = nu_d;
+        p.nu_p = nu_p;
+        p.e_pass = std::max(e_pass, 0.05);
+        p.nu_dp = nu_dp;
+        p.e_dp = std::max(e_dp, 0.05);
+        p.rng_seed = seed;
+        p.pcg.seed((uint64_t)seed);
+
+        if (!g_batch_first_entry)
+            g_batch_json_buf += ",";
+        g_batch_first_entry = false;
+
+        auto t0 = std::chrono::steady_clock::now();
+        try
+        {
+            ElectrodepositionKMC sim(p);
+            int actual_steps = 0;
+            for (int s = 0; s < steps_per_run; s++)
+            {
+                if (!sim.execute_step())
+                    break;
+                actual_steps++;
+            }
+            double wall = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - t0
+            ).count();
+
+            std::ostringstream entry;
+            entry << "{"
+                  << "\"index\":" << index << ","
+                  << "\"d0\":" << p.d0 << ","
+                  << "\"T\":" << p.T << ","
+                  << "\"e0\":" << p.e0 << ","
+                  << "\"e1\":" << p.e1 << ","
+                  << "\"steps_run\":" << actual_steps << ","
+                  << "\"final_step\":" << sim.step() << ","
+                  << "\"final_time\":" << sim.time() << ","
+                  << "\"fill_pct\":" << sim.fill_percentage() << ","
+                  << "\"passivated\":" << sim.passivated_count() << ","
+                  << "\"terminated\":" << (sim.is_terminated() ? 1 : 0) << ","
+                  << "\"wall_time\":" << wall
+                  << "}";
+            g_batch_json_buf += entry.str();
+        }
+        catch (const std::exception &e)
+        {
+            printf("run_batch_single: run %d failed (%s), skipping\n", index, e.what());
+            std::ostringstream entry;
+            entry << "{"
+                  << "\"index\":" << index << ","
+                  << "\"d0\":" << p.d0 << ","
+                  << "\"T\":" << p.T << ","
+                  << "\"e0\":" << p.e0 << ","
+                  << "\"e1\":" << p.e1 << ","
+                  << "\"steps_run\":0,"
+                  << "\"final_step\":0,"
+                  << "\"final_time\":0,"
+                  << "\"fill_pct\":0,"
+                  << "\"passivated\":0,"
+                  << "\"terminated\":1,"
+                  << "\"wall_time\":0"
+                  << "}";
+            g_batch_json_buf += entry.str();
+        }
+    }
+
+    EMSCRIPTEN_KEEPALIVE
+    void run_batch_end()
+    {
+        g_batch_json_buf += "]";
+    }
 
     EMSCRIPTEN_KEEPALIVE
     void run_batch(
