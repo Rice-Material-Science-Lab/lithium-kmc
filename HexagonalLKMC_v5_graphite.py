@@ -85,6 +85,7 @@ FREE       = 1
 DEPOSITED  = 2
 SUBSTRATE  = 3
 PASSIVATED = 4
+CARBON     = 5   # graphite anode site kinda like substrate
 
 Coord = Tuple[int, int]
 
@@ -297,7 +298,7 @@ def _nb_desired_mobile_state(
         if yy < 0 or yy >= Ny:
             continue
         nbr = lattice[yy, xx]
-        if nbr == DEPOSITED or nbr == SUBSTRATE:
+        if nbr == DEPOSITED or nbr == SUBSTRATE or nbr == CARBON:
             return DEPOSITED
     return FREE
 
@@ -778,6 +779,9 @@ class KMCParams:
     plot_counts_vs_time: bool = True         # v3 change: False=plot counts vs step, True=plot counts vs sim time
     stop_fill_fraction: Optional[float] = None
     stop_fill_total_sites: Optional[int] = None
+    carbon_energy: float = -0.6       # eV, graphite anode bond energy (single species)
+    mem_snapshot_every: int = 10_000  # steps between in-memory scrub snapshots
+    max_mem_snapshots: int = 300
 
 
 # ===========================================================================
@@ -845,7 +849,8 @@ class ElectrodepositionKMC:
         self.lattice[0, :] = SUBSTRATE
 
         # ── interaction table ─────────────────────────────────────────────
-        self.energy_lookup = np.zeros((5, 5), dtype=float)
+        # 6x6 instead of 5x5 to add a CARBON row/col. 
+        self.energy_lookup = np.zeros((6, 6), dtype=float)
         el = self.energy_lookup
         el[DEPOSITED,  DEPOSITED]  = self.p.e0
         el[DEPOSITED,  SUBSTRATE]  = self.p.e1
@@ -858,6 +863,12 @@ class ElectrodepositionKMC:
         el[PASSIVATED, PASSIVATED] = self.p.e0
         el[PASSIVATED, SUBSTRATE]  = self.p.e1
         el[SUBSTRATE,  PASSIVATED] = self.p.e1
+        el[FREE,       CARBON]     = self.p.carbon_energy
+        el[CARBON,     FREE]       = self.p.carbon_energy
+        el[DEPOSITED,  CARBON]     = self.p.carbon_energy
+        el[CARBON,     DEPOSITED]  = self.p.carbon_energy
+        el[PASSIVATED, CARBON]     = self.p.carbon_energy
+        el[CARBON,     PASSIVATED] = self.p.carbon_energy
 
         # ── event indexing ────────────────────────────────────────────────
         self.num_drop_events       = self.p.Nx
@@ -899,10 +910,12 @@ class ElectrodepositionKMC:
         self._title = None
 
         self.history: List = []
+        self._mem_snapshots: List[Tuple[int, float, np.ndarray]] = []
 
         # ── initial state ─────────────────────────────────────────────────
         self.rebuild_all_rates()
         self.record_history(label="initial")
+        self.record_mem_snapshot()
         if self.p.save_snapshots:
             self.save_snapshot("initial")
         if self.p.save_npy_states:
@@ -1101,7 +1114,7 @@ class ElectrodepositionKMC:
 
     def desired_mobile_state_at_site(self, x: int, y: int) -> int:
         for nx, ny in self.valid_neighbor_coords(x, y):
-            if int(self.lattice[ny, nx]) in (DEPOSITED, SUBSTRATE):
+            if int(self.lattice[ny, nx]) in (DEPOSITED, SUBSTRATE, CARBON):
                 return DEPOSITED
         return FREE
 
@@ -1194,6 +1207,103 @@ class ElectrodepositionKMC:
             if (x, y) not in queued:
                 q.append((x, y));  queued.add((x, y))
         return list(changed)
+
+    # ------------------------------------------------------------------
+    # New stuff: carbon anode sites, live param updates,
+    # in-memory snapshot history, save/load state
+    # ------------------------------------------------------------------
+
+    def set_carbon_site(self, x: int, y: int) -> None:
+        """Mark a lattice cell as a graphite anode site. Call once per
+        drawn cell, then finalize_carbon_placement() once at the end."""
+        if not (0 <= x < self.p.Nx and 0 <= y < self.p.Ny):
+            return
+        self.lattice[y, x] = CARBON
+
+    def unset_carbon_site(self, x: int, y: int) -> None:
+        """Revert a previously-marked carbon cell back to EMPTY. No-op on
+        a cell that already has an atom bonded to it."""
+        if not (0 <= x < self.p.Nx and 0 <= y < self.p.Ny):
+            return
+        if int(self.lattice[y, x]) == CARBON:
+            self.lattice[y, x] = EMPTY
+
+    def finalize_carbon_placement(self) -> None:
+        """Rebuild rates once after a batch of carbon-site edits, instead
+        of once per cell."""
+        self.rebuild_all_rates()
+
+    def update_params(self, **kwargs) -> None:
+        """Live-update tunable parameters without reconstructing the sim.
+        Only rate/energy fields are accepted; Nx/Ny cannot change here."""
+        live_tunable = {"T", "d0", "e0", "e1", "nu_f", "nu_d", "nu_p", "carbon_energy"}
+        changed = False
+        for key, value in kwargs.items():
+            if key not in live_tunable:
+                continue
+            if getattr(self.p, key) != value:
+                setattr(self.p, key, value)
+                changed = True
+        if not changed:
+            return
+        el = self.energy_lookup
+        el[DEPOSITED,  DEPOSITED]  = self.p.e0
+        el[DEPOSITED,  SUBSTRATE]  = self.p.e1
+        el[SUBSTRATE,  DEPOSITED]  = self.p.e1
+        el[SUBSTRATE,  SUBSTRATE]  = self.p.e1
+        el[PASSIVATED, DEPOSITED]  = self.p.e0
+        el[DEPOSITED,  PASSIVATED] = self.p.e0
+        el[PASSIVATED, PASSIVATED] = self.p.e0
+        el[PASSIVATED, SUBSTRATE]  = self.p.e1
+        el[SUBSTRATE,  PASSIVATED] = self.p.e1
+        el[FREE,       CARBON]     = self.p.carbon_energy
+        el[CARBON,     FREE]       = self.p.carbon_energy
+        el[DEPOSITED,  CARBON]     = self.p.carbon_energy
+        el[CARBON,     DEPOSITED]  = self.p.carbon_energy
+        el[PASSIVATED, CARBON]     = self.p.carbon_energy
+        el[CARBON,     PASSIVATED] = self.p.carbon_energy
+        self.rebuild_all_rates()
+
+    def record_mem_snapshot(self) -> None:
+        """Store a full lattice copy for scrubbing. Bounded: halves the
+        stored history (keeping every other entry) once the cap is hit,
+        same compaction strategy as the WASM version."""
+        self._mem_snapshots.append((self.step, self.time, self.lattice.copy()))
+        if len(self._mem_snapshots) > self.p.max_mem_snapshots:
+            self._mem_snapshots = self._mem_snapshots[::2]
+
+    def snapshot_count(self) -> int:
+        return len(self._mem_snapshots)
+
+    def snapshot_at(self, idx: int) -> Optional[Tuple[int, float, np.ndarray]]:
+        if 0 <= idx < len(self._mem_snapshots):
+            return self._mem_snapshots[idx]
+        return None
+
+    def save_state(self, path: Path) -> None:
+        """Pickle enough state to resume: params, step/time, lattice."""
+        import pickle
+        with open(path, "wb") as f:
+            pickle.dump({
+                "params": self.p,
+                "step": self.step,
+                "time": self.time,
+                "lattice": self.lattice,
+            }, f)
+
+    @classmethod
+    def load_state(cls, path: Path) -> "ElectrodepositionKMC":
+        """Construct a fresh sim from a save_state() file and restore
+        lattice/step/time on top of it."""
+        import pickle
+        with open(path, "rb") as f:
+            blob = pickle.load(f)
+        sim = cls(blob["params"])
+        sim.lattice[:, :] = blob["lattice"]
+        sim.step = blob["step"]
+        sim.time = blob["time"]
+        sim.rebuild_all_rates()
+        return sim
 
     # ------------------------------------------------------------------
     # KMC step (Python path — used when numba unavailable)
@@ -1584,6 +1694,14 @@ class SimulationGUI:
         self.stopped = False
         self.canvas: Optional[FigureCanvasTkAgg] = None
 
+        # allow carbon drawing
+        self.live_mode_var    = tk.BooleanVar(value=False)
+        self.drawing_carbon_var = tk.BooleanVar(value=False)
+        self.carbon_energy_var  = tk.DoubleVar(value=self.params.carbon_energy)
+        self._carbon_sites: dict = {}   # (x, y) -> True, pre-run preview + replay-on-start
+        self._history_mode      = False
+        self._batch_results: List[dict] = []
+
         # v3 change: keep both possible x-axis histories for the GUI count plot.
         self._hist_steps:      List[int] = []
         self._hist_times:      List[float] = []
@@ -1642,6 +1760,9 @@ class SimulationGUI:
         self._build_param_panel(left)
         self._build_control_panel(left)
         self._build_stats_panel(left)
+        self._build_carbon_panel(left)
+        self._build_history_panel(left)
+        self._build_batch_panel(left)
 
         right = ttk.Frame(body)
         right.pack(side="left", fill="both", expand=True)
@@ -1676,7 +1797,192 @@ class SimulationGUI:
                 entry.bind("<Enter>", lambda e, t=tooltip: self.root.title(f"LKMC  ·  {t}"))
                 entry.bind("<Leave>", lambda e: self.root.title(
                     "LKMC — Lattice KMC Electrodeposition"))
+                if pname in ("T", "d0", "e0", "e1", "nu_f", "nu_d", "nu_p"):
+                    entry.bind("<Return>", self._on_live_param_commit)
+                    entry.bind("<FocusOut>", self._on_live_param_commit)
                 self.entries[pname] = (entry, ptype)
+
+    def _build_history_panel(self, parent: ttk.Frame) -> None:
+        frame = ttk.LabelFrame(parent, text="  History  ")
+        frame.pack(fill="x", pady=(0, 6))
+        self._history_var = tk.IntVar(value=0)
+        self._history_scale = ttk.Scale(
+            frame, from_=0, to=0, orient="horizontal",
+            variable=self._history_var, command=self._on_scrub,
+        )
+        self._history_scale.pack(fill="x", padx=8, pady=(6, 2))
+        self._history_label_var = tk.StringVar(value="live")
+        ttk.Label(frame, textvariable=self._history_label_var,
+                  style="Stat.TLabel").pack(padx=8, pady=(0, 2), anchor="w")
+        ttk.Button(frame, text="Back to Live", command=self._back_to_live).pack(
+            fill="x", padx=8, pady=(0, 6))
+
+    def _on_scrub(self, value) -> None:
+        if self.sim is None or not self.paused:
+            return
+        idx = int(float(value))
+        entry = self.sim.snapshot_at(idx)
+        if entry is None:
+            return
+        step, t, lattice = entry
+        self._history_mode = True
+        self._im.set_array(lattice.ravel())
+        self._history_label_var.set(f"step {step:,}  (t={t:.3e}s)")
+        self.canvas.draw_idle()
+
+    def _save_state_now(self) -> None:
+        if self.sim is None:
+            messagebox.showinfo("Nothing to save", "Start a simulation first.")
+            return
+        from tkinter import filedialog
+        path = filedialog.asksaveasfilename(
+            defaultextension=".lkmcstate",
+            filetypes=[("LKMC state", "*.lkmcstate")],
+        )
+        if not path:
+            return
+        try:
+            self.sim.save_state(Path(path))
+        except Exception as exc:
+            messagebox.showerror("Save failed", str(exc))
+            return
+        messagebox.showinfo("Saved", f"State saved to:\n{path}")
+
+    def _load_state_now(self) -> None:
+        from tkinter import filedialog
+        path = filedialog.askopenfilename(filetypes=[("LKMC state", "*.lkmcstate")])
+        if not path:
+            return
+        try:
+            self.sim = ElectrodepositionKMC.load_state(Path(path))
+        except Exception as exc:
+            messagebox.showerror("Load failed", str(exc))
+            return
+        self.params = self.sim.p
+        self.paused = False
+        self.stopped = False
+        self._history_mode = False
+        self._im.set_verts(make_hex_vertices(self.params.Nx, self.params.Ny))
+        (xmin, xmax), (ymin, ymax) = hex_axis_limits(self.params.Nx, self.params.Ny)
+        self._ax_lat.set_xlim(xmin, xmax)
+        self._ax_lat.set_ylim(ymin, ymax)
+        self._history_scale.configure(to=max(0, self.sim.snapshot_count() - 1))
+        self._refresh_lattice()
+        self._refresh_stats()
+        self.canvas.draw_idle()
+        self.run_btn.config(state="disabled")
+        self.root.after(1, self.run_batch)
+
+    def _build_batch_panel(self, parent: ttk.Frame) -> None:
+        frame = ttk.LabelFrame(parent, text="  Batch Run  ")
+        frame.pack(fill="x", pady=(0, 6))
+        ttk.Button(frame, text="Configure & Run Sweep…", command=self._open_batch_dialog).pack(
+            fill="x", padx=8, pady=6)
+
+    def _open_batch_dialog(self) -> None:
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Batch Run")
+        dlg.configure(bg=self._colors["BG"])
+
+        param_var = tk.StringVar(value="T")
+        min_var   = tk.StringVar(value="250")
+        max_var   = tk.StringVar(value="400")
+        count_var = tk.StringVar(value="5")
+        steps_var = tk.StringVar(value="200000")
+
+        rows = [
+            ("Sweep parameter (T or d0)", param_var),
+            ("Min", min_var),
+            ("Max", max_var),
+            ("Runs", count_var),
+            ("Steps / run", steps_var),
+        ]
+        for i, (label, var) in enumerate(rows):
+            ttk.Label(dlg, text=label).grid(row=i, column=0, sticky="w", padx=8, pady=4)
+            ttk.Entry(dlg, textvariable=var, width=16).grid(row=i, column=1, padx=8, pady=4)
+
+        result_box = tk.Text(dlg, width=60, height=12, bg=self._colors["ENTRY"],
+                              fg=self._colors["FG"])
+        result_box.grid(row=len(rows), column=0, columnspan=2, padx=8, pady=8)
+
+        def run_sweep():
+            try:
+                count = max(1, int(count_var.get()))
+                lo = float(min_var.get())
+                hi = float(max_var.get())
+                steps_per_run = max(1, int(steps_var.get()))
+                sweep_param = param_var.get().strip()
+                if sweep_param not in ("T", "d0"):
+                    raise ValueError("Sweep parameter must be 'T' or 'd0'.")
+            except ValueError as exc:
+                messagebox.showerror("Invalid input", str(exc))
+                return
+
+            results = []
+            result_box.delete("1.0", "end")
+            for i in range(count):
+                t = 0.0 if count == 1 else i / (count - 1)
+                value = lo + t * (hi - lo)
+                p = KMCParams(**{**vars(self.params)})
+                setattr(p, sweep_param, value)
+                p.save_snapshots = False
+                p.save_npy_states = False
+                p.output_dir = str(Path(self.params.output_dir) / "batch_tmp")
+                try:
+                    sim = ElectrodepositionKMC(p)
+                    for (cx, cy) in self._carbon_sites:
+                        sim.set_carbon_site(cx, cy)
+                    if self._carbon_sites:
+                        sim.finalize_carbon_placement()
+                    remaining = steps_per_run
+                    while remaining > 0:
+                        batch = min(50_000, remaining)
+                        done, finished = sim.run_n_steps_fast(batch)
+                        remaining -= done
+                        if finished:
+                            break
+                    _, n_dep, n_pass, _ = sim.counts()
+                    fill_pct = 100.0 * (n_dep + n_pass) / (p.Nx * p.Ny)
+                    row = {
+                        "index": i, sweep_param: value,
+                        "final_step": sim.step, "fill_pct": round(fill_pct, 2),
+                        "passivated": n_pass, "terminated": sim.ftree.total() <= 0.0,
+                    }
+                except Exception as exc:
+                    row = {"index": i, sweep_param: value, "error": str(exc)}
+                results.append(row)
+                result_box.insert("end", f"{row}\n")
+                dlg.update()
+
+            self._batch_results = results
+
+        def export_csv():
+            if not self._batch_results:
+                return
+            from tkinter import filedialog
+            path = filedialog.asksaveasfilename(defaultextension=".csv")
+            if not path:
+                return
+            fieldnames = sorted({k for row in self._batch_results for k in row.keys()})
+            with open(path, "w", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerows(self._batch_results)
+            messagebox.showinfo("Exported", f"Saved to:\n{path}")
+
+        btn_row = ttk.Frame(dlg)
+        btn_row.grid(row=len(rows) + 1, column=0, columnspan=2, pady=(0, 8))
+        ttk.Button(btn_row, text="Run", command=run_sweep).pack(side="left", padx=4)
+        ttk.Button(btn_row, text="Export CSV", command=export_csv).pack(side="left", padx=4)
+
+    def _back_to_live(self) -> None:
+        self._history_mode = False
+        self._history_label_var.set("live")
+        if self.sim is not None:
+            self._history_scale.configure(to=max(0, self.sim.snapshot_count() - 1))
+            self._history_var.set(max(0, self.sim.snapshot_count() - 1))
+            self._refresh_lattice()
+            self.canvas.draw_idle()
 
     def _build_control_panel(self, parent: ttk.Frame) -> None:
         frame = ttk.LabelFrame(parent, text="  Controls  ")
@@ -1688,6 +1994,18 @@ class SimulationGUI:
         for i, btn in enumerate([self.run_btn, self.pause_btn, self.stop_btn, self.save_btn]):
             btn.grid(row=i // 2, column=i % 2, padx=6, pady=4, sticky="ew")
         frame.columnconfigure(0, weight=1); frame.columnconfigure(1, weight=1)
+
+        ttk.Checkbutton(
+            frame, text="Live Mode (apply param edits while running)",
+            variable=self.live_mode_var,
+        ).grid(row=2, column=0, columnspan=2, sticky="w", padx=6, pady=(4, 6))
+
+        state_frame = ttk.Frame(frame)
+        state_frame.grid(row=3, column=0, columnspan=2, sticky="ew", padx=6, pady=(0, 4))
+        ttk.Button(state_frame, text="Save State…", command=self._save_state_now).pack(
+            side="left", expand=True, fill="x", padx=(0, 3))
+        ttk.Button(state_frame, text="Load State…", command=self._load_state_now).pack(
+            side="left", expand=True, fill="x", padx=(3, 0))
 
     def _build_stats_panel(self, parent: ttk.Frame) -> None:
         frame = ttk.LabelFrame(parent, text="  Live Statistics  ")
@@ -1722,6 +2040,72 @@ class SimulationGUI:
             tk.Label(legend_frame, text=f" {text}  ",
                      bg=self._colors["PANEL"], fg=self._colors["FG"],
                      font=("Segoe UI", 8)).pack(side="left")
+
+    def _build_carbon_panel(self, parent: ttk.Frame) -> None:
+        frame = ttk.LabelFrame(parent, text="  Carbon Anode  ")
+        frame.pack(fill="x", pady=(0, 6))
+        ttk.Checkbutton(
+            frame, text="Draw Carbon (click lattice)",
+            variable=self.drawing_carbon_var,
+        ).grid(row=0, column=0, columnspan=2, sticky="w", padx=8, pady=(4, 2))
+        ttk.Label(frame, text="Bond energy (eV)", anchor="w").grid(
+            row=1, column=0, sticky="w", padx=(8, 4), pady=2)
+        entry = ttk.Entry(frame, textvariable=self.carbon_energy_var, width=13)
+        entry.grid(row=1, column=1, padx=(0, 8), pady=2)
+        entry.bind("<Return>", self._on_live_param_commit)
+        entry.bind("<FocusOut>", self._on_live_param_commit)
+        ttk.Button(frame, text="Clear Carbon", command=self._clear_carbon).grid(
+            row=2, column=0, columnspan=2, sticky="ew", padx=8, pady=(2, 6))
+
+    def _clear_carbon(self) -> None:
+        if self.sim is not None:
+            for (cx, cy) in list(self._carbon_sites.keys()):
+                self.sim.unset_carbon_site(cx, cy)
+            self.sim.finalize_carbon_placement()
+            self._refresh_lattice()
+            self.canvas.draw_idle()
+        self._carbon_sites.clear()
+
+    def _on_lattice_click(self, event) -> None:
+        if not self.drawing_carbon_var.get():
+            return
+        if event.inaxes != self._ax_lat:
+            return
+        if event.xdata is None or event.ydata is None:
+            return
+        # Inverts the row/column layout used in make_hex_vertices(). NOTE:
+        # this hit-testing was written without being able to render and
+        # click-test it -- verify it lands on the cell you actually click,
+        # and adjust the rounding/offset below if it's off by one row/col.
+        radius = 1.0 / math.sqrt(3.0)
+        row_step = 1.5 * radius
+        Nx, Ny = self.params.Nx, self.params.Ny
+        y = int(round(event.ydata / row_step))
+        y = max(0, min(Ny - 1, y))
+        row_offset = 0.5 if y % 2 else 0.0
+        x = int(round(event.xdata - row_offset))
+        x = max(0, min(Nx - 1, x))
+
+        key = (x, y)
+        if key in self._carbon_sites:
+            del self._carbon_sites[key]
+            if self.sim is not None:
+                self.sim.unset_carbon_site(x, y)
+        else:
+            self._carbon_sites[key] = True
+            if self.sim is not None:
+                self.sim.set_carbon_site(x, y)
+
+        if self.sim is not None:
+            self.sim.finalize_carbon_placement()
+            self._refresh_lattice()
+        else:
+            # Pre-run preview: overlay carbon marks on a blank lattice.
+            preview = np.zeros((Ny, Nx), dtype=np.int8)
+            for (px, py) in self._carbon_sites:
+                preview[py, px] = CARBON
+            self._im.set_array(preview.ravel())
+        self.canvas.draw_idle()
 
     def _build_plot_area(self, parent: ttk.Frame) -> None:
         C = self._colors
@@ -1772,6 +2156,7 @@ class SimulationGUI:
         self.canvas = FigureCanvasTkAgg(self._fig, master=parent)
         self.canvas.get_tk_widget().pack(fill="both", expand=True)
         self.canvas.draw()
+        self.canvas.mpl_connect("button_press_event", self._on_lattice_click)
 
         # Status bar
         self._status_var = tk.StringVar(value="Ready.")
@@ -1812,6 +2197,23 @@ class SimulationGUI:
         self.paused = not self.paused
         self.pause_btn.config(text="▶  Resume" if self.paused else "⏸  Pause")
 
+    def _on_live_param_commit(self, event=None) -> None:
+        if not self.live_mode_var.get() or self.sim is None:
+            return
+        updates = {}
+        for pname in ("T", "d0", "e0", "e1", "nu_f", "nu_d", "nu_p"):
+            entry, ptype = self.entries[pname]
+            raw = entry.get().strip()
+            try:
+                updates[pname] = ptype(raw)
+            except ValueError:
+                continue
+        try:
+            updates["carbon_energy"] = float(self.carbon_energy_var.get())
+        except (tk.TclError, ValueError):
+            pass
+        self.sim.update_params(**updates)
+
     def stop_simulation(self) -> None:
         self.stopped = True
 
@@ -1849,6 +2251,12 @@ class SimulationGUI:
             messagebox.showerror("Simulation error", str(exc))
             return
 
+        # Replay any carbon sites drawn before this run started.
+        if self._carbon_sites:
+            for (cx, cy) in self._carbon_sites:
+                self.sim.set_carbon_site(cx, cy)
+            self.sim.finalize_carbon_placement()
+
         blank = np.zeros((self.params.Ny, self.params.Nx), dtype=np.int8)
         self._im.set_verts(make_hex_vertices(self.params.Nx, self.params.Ny))
         self._im.set_array(blank.ravel())
@@ -1873,7 +2281,7 @@ class SimulationGUI:
     # ── GUI update helpers ─────────────────────────────────────────────
 
     def _refresh_lattice(self) -> None:
-        if self.sim is None:
+        if self.sim is None or self._history_mode:
             return
         self._im.set_array(self.sim.lattice.ravel())
         self._ax_lat.set_title(
@@ -1952,6 +2360,15 @@ class SimulationGUI:
                     self.sim.save_snapshot(tag)
                 if self.sim.p.save_npy_states:
                     self.sim.save_lattice_npy(tag)
+
+        # ── In-memory scrubbing history snapshot
+        mem_ev = self.sim.p.mem_snapshot_every
+        first_mem = (old_step // mem_ev + 1) * mem_ev
+        if first_mem <= self.sim.step:
+            self.sim.record_mem_snapshot()
+            self._history_scale.configure(to=max(0, self.sim.snapshot_count() - 1))
+            if not self._history_mode:
+                self._history_var.set(self.sim.snapshot_count() - 1)
 
         # ── Update GUI (throttled to ~20 FPS so matplotlib doesn't dominate) ──
         now = time.perf_counter()
