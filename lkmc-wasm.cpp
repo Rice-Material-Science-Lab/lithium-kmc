@@ -222,9 +222,9 @@ struct KMCParams
     double e0 = -0.28;
     double e1 = -0.50;
     double carbon_species_energy[MAX_CARBON_SPECIES] = {-0.6, -0.4, -0.8, -0.3}; // eV, per anode species
-    double nu_f = 5e7;
-    double nu_d = 1e7;
-    double nu_p = 1e6;
+    double nu_f = 5e9;  // matches Python KMCParams default
+    double nu_d = 5e9;  // matches Python KMCParams default
+    double nu_p = 1e3;  // matches Python KMCParams default
     double e_pass = 0.3; // eV — passivation activation energy barrier
     // Literature-cited SEI-forming decomposition barriers cluster
     // around 0.3-0.5 eV, close to (not far above) typical surface hop
@@ -514,28 +514,22 @@ public:
         for (int x = 0; x < p_.Nx; ++x)
             at(x, 0) = SUBSTRATE;
 
-        // Build interaction lookup (indexed by [from_type][to_type]).
-        // Matches the Python energy_lookup table exactly.
         memset(energy_lookup_, 0, sizeof(energy_lookup_));
-        energy_lookup_[FREE][DEPOSITED] = p_.e0;
-        energy_lookup_[DEPOSITED][FREE] = p_.e0;
         energy_lookup_[DEPOSITED][DEPOSITED] = p_.e0;
-        energy_lookup_[FREE][SUBSTRATE] = p_.e1;
-        energy_lookup_[SUBSTRATE][FREE] = p_.e1;
         energy_lookup_[DEPOSITED][SUBSTRATE] = p_.e1;
         energy_lookup_[SUBSTRATE][DEPOSITED] = p_.e1;
         energy_lookup_[SUBSTRATE][SUBSTRATE] = p_.e1;
-        // PASSIVATED interacts exactly like DEPOSITED
-        energy_lookup_[FREE][PASSIVATED] = p_.e0;
-        energy_lookup_[PASSIVATED][FREE] = p_.e0;
-        energy_lookup_[DEPOSITED][PASSIVATED] = p_.e0;
         energy_lookup_[PASSIVATED][DEPOSITED] = p_.e0;
+        energy_lookup_[DEPOSITED][PASSIVATED] = p_.e0;
         energy_lookup_[PASSIVATED][PASSIVATED] = p_.e0;
         energy_lookup_[PASSIVATED][SUBSTRATE] = p_.e1;
         energy_lookup_[SUBSTRATE][PASSIVATED] = p_.e1;
-        // Li-C bond energy: carbon interacts with FREE/DEPOSITED/PASSIVATED
-        // atoms the same way SUBSTRATE does via e1, but with its own
-        // independently-tunable e_c value.
+        energy_lookup_[FREE][CARBON] = p_.carbon_species_energy[0];
+        energy_lookup_[CARBON][FREE] = p_.carbon_species_energy[0];
+        energy_lookup_[DEPOSITED][CARBON] = p_.carbon_species_energy[0];
+        energy_lookup_[CARBON][DEPOSITED] = p_.carbon_species_energy[0];
+        energy_lookup_[PASSIVATED][CARBON] = p_.carbon_species_energy[0];
+        energy_lookup_[CARBON][PASSIVATED] = p_.carbon_species_energy[0];
 
 // Prepare output directory.
 #ifndef __EMSCRIPTEN__
@@ -870,20 +864,32 @@ private:
     double calc_local_energy(int x, int y, int8_t atom_type) const
     {
         double e = 0.0;
-
-        int coord = 0;
+        int dep_neighbors_at_site = -1;
+        if (atom_type == DEPOSITED)
+            dep_neighbors_at_site = coordination_number(x, y);
 
         for_each_neighbour(x, y, [&](int nx, int ny)
         {
             int8_t n = at(nx, ny);
 
-            if (n == DEPOSITED || n == PASSIVATED)
-                coord++;
-
             if (n == CARBON)
+            {
                 e += carbon_bond_energy_at(nx, ny);
+            }
+            else if (atom_type == DEPOSITED && n == PASSIVATED)
+            {
+                if (dep_neighbors_at_site >= 2)
+                    e += energy_lookup_[DEPOSITED][PASSIVATED];
+            }
+            else if (atom_type == PASSIVATED && n == DEPOSITED)
+            {
+                if (coordination_number(nx, ny) >= 2)
+                    e += energy_lookup_[PASSIVATED][DEPOSITED];
+            }
             else
+            {
                 e += energy_lookup_[atom_type][n];
+            }
         });
 
         return e;
@@ -904,6 +910,17 @@ private:
         return coord;
     }
 
+    int deposited_only_neighbor_count(int x, int y) const
+    {
+        int n_dep = 0;
+        for_each_neighbour(x, y, [&](int nx, int ny)
+        {
+            if (at(nx, ny) == DEPOSITED)
+                n_dep++;
+        });
+        return n_dep;
+    }
+
     double bond_energy(int coordination) const
     {
         // Simple version
@@ -911,103 +928,40 @@ private:
         return p_.e0 * coordination;
     }
 
+    // Rate formulas below mirror LKMC_v5_gui_fast.py's Numba kernel
+    // (_nb_get_event_rate) exactly -- the Python file is the source of
+    // truth for simulation physics. No custom barriers, no exposure
+    // fraction, no SEI growth suppression, no de-passivation: none of
+    // that exists in the Python kernel.
     double get_event_rate(const Event &ev) const
     {
         if (ev.is_drop)
         {
             int x1 = ev.dx;
             int y1 = ev.dy;
-
-            if (at(x1, y1) != EMPTY)
-                return 0.0;
-
-            int coord = coordination_number(x1, y1);
-
-            double E_dep = 0.15 - 0.02 * coord;
-
-            if(E_dep < 0.02)
-                E_dep = 0.02;
-
-            return p_.d0 *
-                exp(
-                    -E_dep /
-                    (p_.kB * p_.T)
-                );
+            return (at(x1, y1) == EMPTY) ? p_.d0 : 0.0;
         }
+
+        // de-passivation does not exist in the Python kernel -- always 0.
+        if (ev.is_depassivation)
+            return 0.0;
 
         int x0 = ev.sx, y0 = ev.sy;
         int8_t atype = at(x0, y0);
-        // passivation event
-        if(ev.is_passivation)
+
+        if (ev.is_passivation)
         {
             if (atype != DEPOSITED)
                 return 0.0;
-            // Passivation only occurs on exposed deposited atoms
             bool exposed = false;
-            int empty_neighbors = 0;
-            int passivated_neighbors = 0;
             for_each_neighbour(x0, y0, [&](int nx, int ny)
-                               {
-                int8_t n = at(nx, ny);
-                if(n == EMPTY) {
+            {
+                if (at(nx, ny) == EMPTY)
                     exposed = true;
-                    empty_neighbors++;
-                }
-                if(n == PASSIVATED) {
-                    passivated_neighbors++;
-                } });
-            if (!exposed)
-                return 0.0;
-            // Apply the same Boltzmann suppression as hop/drop events so
-            // passivation competes fairly with growth instead of
-            // dominating regardless of temperature.
-            // empty_neighbors ranges 0-6 on this hex lattice; divide by 6
-            // so the exposure factor is a genuine 0-1 fraction instead of
-            // occasionally exceeding 1.0 (the old /3.0 let a fully exposed
-            double exposure_fraction = empty_neighbors / 6.0;
-
-            // Self-limiting SEI growth: real SEI formation is
-            // diffusion-limited once a passivation layer already exists
-            // nearby (Peled's SEI model -- roughly parabolic/sqrt(t)
-            // growth, not unbounded). Model this as an extra activation
-            // barrier per already-passivated neighbor: a bare exposed
-            // atom still passivates readily (an initial monolayer forms
-            // fast, matching how real SEI forms within seconds of
-            // electrolyte contact), but further growth into an
-            // already-coated region is exponentially suppressed instead
-            // of running away to cover the whole lattice.
-            static constexpr double kSeiGrowthBarrier = 0.15; // eV/neighbor
-            double local_barrier =
-                p_.e_pass + kSeiGrowthBarrier * passivated_neighbors;
-
-            return p_.nu_p *
-                exp(-local_barrier / (p_.kB * p_.T)) *
-                exposure_fraction;
+            });
+            return exposed ? p_.nu_p : 0.0;
         }
-        // de-passivation (SEI breakdown) event, reverts an exposed
-        // PASSIVATED atom back to DEPOSITED. Mirrors the passivation
-        // rate shape (same exposure-fraction weighting) but with its
-        // own independently-tunable frequency/barrier so growth and
-        // breakdown can be tuned separately.
-        if (ev.is_depassivation)
-        {
-            if (atype != PASSIVATED)
-                return 0.0;
-            bool exposed = false;
-            int empty_neighbors = 0;
-            for_each_neighbour(x0, y0, [&](int nx, int ny)
-                               {
-                if(at(nx,ny) == EMPTY) {
-                    exposed = true;
-                    empty_neighbors++;
-                } });
-            if (!exposed)
-                return 0.0;
-            double exposure_fraction = empty_neighbors / 6.0;
-            return p_.nu_dp *
-                exp(-p_.e_dp / (p_.kB * p_.T)) *
-                exposure_fraction;
-        }
+
         if (atype != FREE && atype != DEPOSITED)
             return 0.0;
 
@@ -1020,38 +974,22 @@ private:
 
         double nu = (atype == FREE) ? p_.nu_f : p_.nu_d;
         double e_init = calc_local_energy(x0, y0, atype);
-        int coord_initial = coordination_number(x0, y0);
 
-        // Temporarily remove atom to compute destination energy.
-        int8_t old = const_cast<ElectrodepositionKMC *>(this)->at(x0,y0);
+        int8_t old = const_cast<ElectrodepositionKMC *>(this)->at(x0, y0);
+        const_cast<ElectrodepositionKMC *>(this)->at(x0, y0) = EMPTY;
 
-        const_cast<ElectrodepositionKMC *>(this)->at(x0,y0) = EMPTY;
+        // desired_bond_state (FREE vs DEPOSITED) at destination, mirroring
+        // Python's _nb_desired_mobile_state.
+        int8_t final_type = desired_bond_state(x1, y1);
+        double e_final = calc_local_energy(x1, y1, final_type);
 
-        double e_final = calc_local_energy(x1,y1,atype);
-        const_cast<ElectrodepositionKMC *>(this)->at(x0,y0) = old;
-        if(!std::isfinite(e_final) || !std::isfinite(e_init))
-        {
-            const_cast<ElectrodepositionKMC *>(this)->at(x0,y0)=old;
+        const_cast<ElectrodepositionKMC *>(this)->at(x0, y0) = old;
+
+        if (!std::isfinite(e_final) || !std::isfinite(e_init))
             return 0.0;
-        }
-        int coord_final = coordination_number(x1, y1);
-        const_cast<ElectrodepositionKMC *>(this)->at(x0, y0) = atype;
 
-        double barrier =
-            0.15 + 
-            0.03 * std::max(0, coord_initial - coord_final);
-
-        double energy_penalty = std::max(0.0, e_final - e_init);
-
-        double rate =
-            nu *
-            exp(
-                -(barrier + energy_penalty)
-                /
-                (p_.kB * p_.T)
-            );
-
-        return rate;
+        double dE = e_final - e_init;
+        return nu * exp(-dE / (2.0 * p_.kB * p_.T));
     }
 
     void update_rate_at(int idx)
