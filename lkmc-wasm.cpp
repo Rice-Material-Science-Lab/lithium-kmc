@@ -235,7 +235,7 @@ struct KMCParams
     double e_dp = 0.5;   // eV — de-passivation activation energy barrier;
     // higher than e_pass by default so passivation
     // is the dominant direction unless tuned otherwise
-    // i love comments :]
+
     double kB = 8.617333262145e-5; // eV / K
     int max_steps = 400000;
     double max_time = 100.0;
@@ -861,12 +861,12 @@ private:
         return p_.carbon_species_energy[sp];
     }
 
-    double calc_local_energy(int x, int y, int8_t atom_type) const
+        double calc_local_energy(int x, int y, int8_t atom_type) const
     {
         double e = 0.0;
         int dep_neighbors_at_site = -1;
         if (atom_type == DEPOSITED)
-            dep_neighbors_at_site = coordination_number(x, y);
+            dep_neighbors_at_site = deposited_only_neighbor_count(x, y);
 
         for_each_neighbour(x, y, [&](int nx, int ny)
         {
@@ -883,7 +883,7 @@ private:
             }
             else if (atom_type == PASSIVATED && n == DEPOSITED)
             {
-                if (coordination_number(nx, ny) >= 2)
+                if (deposited_only_neighbor_count(nx, ny) >= 2)
                     e += energy_lookup_[PASSIVATED][DEPOSITED];
             }
             else
@@ -1098,7 +1098,6 @@ private:
         for_each_neighbour(x, y, [&](int nx, int ny)
                            {
                 if (at(nx, ny) == DEPOSITED ||
-                    at(nx, ny) == PASSIVATED ||
                     at(nx, ny) == SUBSTRATE ||
                     at(nx, ny) == CARBON)
                     bonded = true; });
@@ -1317,22 +1316,15 @@ public:
         // refreshed live. CARBON energies are looked up per-cell via
         // carbon_species_energy[] instead, and are set independently via
         // set_carbon_species_energy().
-        energy_lookup_[FREE][DEPOSITED] = p_.e0;
-        energy_lookup_[DEPOSITED][FREE] = p_.e0;
         energy_lookup_[DEPOSITED][DEPOSITED] = p_.e0;
-        energy_lookup_[FREE][SUBSTRATE] = p_.e1;
-        energy_lookup_[SUBSTRATE][FREE] = p_.e1;
         energy_lookup_[DEPOSITED][SUBSTRATE] = p_.e1;
         energy_lookup_[SUBSTRATE][DEPOSITED] = p_.e1;
         energy_lookup_[SUBSTRATE][SUBSTRATE] = p_.e1;
-        energy_lookup_[FREE][PASSIVATED] = p_.e0;
-        energy_lookup_[PASSIVATED][FREE] = p_.e0;
         energy_lookup_[DEPOSITED][PASSIVATED] = p_.e0;
         energy_lookup_[PASSIVATED][DEPOSITED] = p_.e0;
         energy_lookup_[PASSIVATED][PASSIVATED] = p_.e0;
         energy_lookup_[PASSIVATED][SUBSTRATE] = p_.e1;
         energy_lookup_[SUBSTRATE][PASSIVATED] = p_.e1;
-
         // Important: old rates are now invalid
         parameters_changed_ = true;
     }
