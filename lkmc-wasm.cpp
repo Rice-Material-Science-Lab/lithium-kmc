@@ -474,6 +474,10 @@ public:
     // Events per lattice site: 6 hop directions + 1 passivation + 1
     // de-passivation (SEI breakdown, reverts PASSIVATED -> DEPOSITED).
     static constexpr int kEventsPerSite = 8;
+    // How often (in steps) to fully recompute every rate from scratch,
+    // correcting the floating-point drift that accumulates from
+    // incremental Fenwick-tree updates over long runs.
+    static constexpr int kRebuildInterval = 50000;
 
     explicit ElectrodepositionKMC(const KMCParams &p)
         : p_(p),
@@ -1141,6 +1145,10 @@ public:
             rebuild_all_rates();
             parameters_changed_ = false;
         }
+        else if (step_ > 0 && step_ % kRebuildInterval == 0)
+        {
+            rebuild_all_rates();
+        }
         double r_tot = ftree_.total();
 #ifndef __EMSCRIPTEN__
         if(step_ % 100 == 0)
@@ -1155,7 +1163,8 @@ public:
         }
 #endif
 
-        if (r_tot <= 0.0)
+        constexpr double kMinRate = 1e-9;
+        if (r_tot <= kMinRate)
         {
             int empty = 0;
             int free = 0;
