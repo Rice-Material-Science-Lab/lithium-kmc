@@ -4,7 +4,7 @@
  * WASM version of C++ port of LKMC_v2_commented_b.py.
  *
  *  * Build:
- * em++ lkmc-wasm.cpp -o public/lkmc-wasm.js -O3 -std=c++17 -fexceptions -sINITIAL_MEMORY=268435456 -sALLOW_MEMORY_GROWTH=1 -sEXPORT_ES6=1 -sMODULARIZE=1 -sEXPORTED_FUNCTIONS="['_set_params','_set_carbon_species_energy','_get_carbon_species_grid','_update_simulation_params','_init_simulation','_mark_carbon','_unmark_carbon','_finalize_carbon_placement','_run_steps','_get_lattice_data','_get_width','_get_stats_json','_get_stats_json_len','_get_height','_get_lattice','_get_lattice_size','_get_fill','_get_passivated','_get_step','_get_time','_get_wall_time','_play','_pause','_stop','_step_once','_playback_tick','_set_batch_size','_set_stats_interval','_get_stats_interval','_get_playback_state','_get_terminated','_get_cell_coordination','_get_snapshot_count','_get_snapshot_step','_get_snapshot_lattice','_save_state','_get_save_state_len','_load_state','_peek_state_dimensions','_run_batch','_run_batch_begin','_run_batch_single','_run_batch_end','_get_batch_json','_cleanup_simulation','_force_update_frontend','_malloc','_free']" -sEXPORTED_RUNTIME_METHODS="['ccall','cwrap','HEAP8','HEAPU8','HEAP32','HEAPF64','wasmMemory']" -sALLOW_TABLE_GROWTH=1
+ * em++ lkmc-wasm.cpp -o public/lkmc-wasm.js -O3 -std=c++17 -fexceptions -sINITIAL_MEMORY=268435456 -sALLOW_MEMORY_GROWTH=1 -sEXPORT_ES6=1 -sMODULARIZE=1 -sEXPORTED_FUNCTIONS="['_set_params','_update_simulation_params','_init_simulation','_mark_carbon','_unmark_carbon','_finalize_carbon_placement','_run_steps','_get_lattice_data','_get_width','_get_stats_json','_get_stats_json_len','_get_height','_get_lattice','_get_lattice_size','_get_fill','_get_passivated','_get_step','_get_time','_get_wall_time','_play','_pause','_stop','_step_once','_playback_tick','_set_batch_size','_set_stats_interval','_get_stats_interval','_get_playback_state','_get_terminated','_get_cell_coordination','_get_snapshot_count','_get_snapshot_step','_get_snapshot_lattice','_save_state','_get_save_state_len','_load_state','_peek_state_dimensions','_run_batch','_run_batch_begin','_run_batch_single','_run_batch_end','_get_batch_json','_cleanup_simulation','_force_update_frontend','_malloc','_free']" -sEXPORTED_RUNTIME_METHODS="['ccall','cwrap','HEAP8','HEAPU8','HEAP32','HEAPF64','wasmMemory']" -sALLOW_TABLE_GROWTH=1
  * Exported WASM stuff:
  *   _set_params(int Nx, int Ny, double d0, double T, double e0, double e1, double nu_f, double nu_d, double nu_p, double e_pass, double nu_dp, double e_dp, int seed)
  *   _update_simulation_params(double d0, double T, double nu_f, double nu_d, double nu_p, double e_pass, double e0, double e1, double nu_dp, double e_dp)
@@ -188,7 +188,6 @@ constexpr int8_t DEPOSITED = 2;
 constexpr int8_t SUBSTRATE = 3;
 constexpr int8_t PASSIVATED = 4;
 constexpr int8_t CARBON = 5; // graphite anode site -- rigid, permanent, like SUBSTRATE
-constexpr int MAX_CARBON_SPECIES = 4;
 // ---------------------------------------------------------------------------
 // Hexagonal lattice neighbour offsets (odd-r horizontal layout)
 // ---------------------------------------------------------------------------
@@ -221,21 +220,12 @@ struct KMCParams
     double d0 = 1000.0;
     double e0 = -0.28;
     double e1 = -0.50;
-    double carbon_species_energy[MAX_CARBON_SPECIES] = {-0.6, -0.4, -0.8, -0.3}; // eV, per anode species
+    double carbon_energy = -0.6; // eV — graphite anode bond energy (single
+    // species, matches Python KMCParams.carbon_energy exactly). Baked into
+    // energy_lookup_ like any other pair, not looked up separately.
     double nu_f = 5e9;  // matches Python KMCParams default
     double nu_d = 5e9;  // matches Python KMCParams default
     double nu_p = 1e3;  // matches Python KMCParams default
-    double e_pass = 0.3; // eV — passivation activation energy barrier
-    // Literature-cited SEI-forming decomposition barriers cluster
-    // around 0.3-0.5 eV, close to (not far above) typical surface hop
-    // barriers here (~0.15-0.3 eV) -- 0.3 keeps passivation reachable
-    // and occasionally competitive rather than mathematically
-    // unreachable given nu_p's slider range.
-    double nu_dp = 1e5;  // de-passivation (SEI breakdown) attempt frequency
-    double e_dp = 0.5;   // eV — de-passivation activation energy barrier;
-    // higher than e_pass by default so passivation
-    // is the dominant direction unless tuned otherwise
-
     double kB = 8.617333262145e-5; // eV / K
     int max_steps = 400000;
     double max_time = 100.0;
@@ -457,10 +447,7 @@ struct StatsRow
     int substrate;
     double fill;
     double total_rate;
-    double e_pass_used;   // debug: the e_pass value active at this step
     double nu_p_used;     // debug: the nu_p value active at this step
-    double e_dp_used;     // debug: the e_dp value active at this step
-    double nu_dp_used;    // debug: the nu_dp value active at this step
 };
 
 // ---------------------------------------------------------------------------
@@ -492,7 +479,6 @@ public:
         : p_(p),
           rng_(p.pcg),
           lattice_(p.Ny * p.Nx, EMPTY),
-          carbon_species_((size_t)p.Nx * p.Ny, -1),
           num_drop_(p.Nx),
           num_hop_(p.Nx * p.Ny * kEventsPerSite),
           max_events_(p.Nx + p.Nx * p.Ny * kEventsPerSite),
@@ -524,12 +510,12 @@ public:
         energy_lookup_[PASSIVATED][PASSIVATED] = p_.e0;
         energy_lookup_[PASSIVATED][SUBSTRATE] = p_.e1;
         energy_lookup_[SUBSTRATE][PASSIVATED] = p_.e1;
-        energy_lookup_[FREE][CARBON] = p_.carbon_species_energy[0];
-        energy_lookup_[CARBON][FREE] = p_.carbon_species_energy[0];
-        energy_lookup_[DEPOSITED][CARBON] = p_.carbon_species_energy[0];
-        energy_lookup_[CARBON][DEPOSITED] = p_.carbon_species_energy[0];
-        energy_lookup_[PASSIVATED][CARBON] = p_.carbon_species_energy[0];
-        energy_lookup_[CARBON][PASSIVATED] = p_.carbon_species_energy[0];
+        energy_lookup_[FREE][CARBON] = p_.carbon_energy;
+        energy_lookup_[CARBON][FREE] = p_.carbon_energy;
+        energy_lookup_[DEPOSITED][CARBON] = p_.carbon_energy;
+        energy_lookup_[CARBON][DEPOSITED] = p_.carbon_energy;
+        energy_lookup_[PASSIVATED][CARBON] = p_.carbon_energy;
+        energy_lookup_[CARBON][PASSIVATED] = p_.carbon_energy;
 
 // Prepare output directory.
 #ifndef __EMSCRIPTEN__
@@ -853,15 +839,7 @@ private:
     // -----------------------------------------------------------------------
     // Energetics
     // -----------------------------------------------------------------------
-    double carbon_bond_energy_at(int nx, int ny) const
-    {
-        int8_t sp = carbon_species_[ny * p_.Nx + nx];
-        if (sp < 0 || sp >= MAX_CARBON_SPECIES)
-            sp = 0;
-        return p_.carbon_species_energy[sp];
-    }
-
-        double calc_local_energy(int x, int y, int8_t atom_type) const
+    double calc_local_energy(int x, int y, int8_t atom_type) const
     {
         double e = 0.0;
         int dep_neighbors_at_site = -1;
@@ -872,11 +850,7 @@ private:
         {
             int8_t n = at(nx, ny);
 
-            if (n == CARBON)
-            {
-                e += carbon_bond_energy_at(nx, ny);
-            }
-            else if (atom_type == DEPOSITED && n == PASSIVATED)
+            if (atom_type == DEPOSITED && n == PASSIVATED)
             {
                 if (dep_neighbors_at_site >= 2)
                     e += energy_lookup_[DEPOSITED][PASSIVATED];
@@ -1290,11 +1264,9 @@ public:
         double nu_f,
         double nu_d,
         double nu_p,
-        double e_pass,
         double e0,
         double e1,
-        double nu_dp,
-        double e_dp
+        double carbon_energy
     )
     {
         p_.d0 = d0;
@@ -1302,20 +1274,12 @@ public:
         p_.nu_f = nu_f;
         p_.nu_d = nu_d;
         p_.nu_p = nu_p;
-        // Floor at 0.05 eV: passivation should always carry some
-        // suppression relative to growth. Prevents a caller (or a future
-        // plumbing bug) from silently disabling the Boltzmann barrier by
-        // passing 0, which would let passivation dominate unrealistically.
-        p_.e_pass = std::max(e_pass, 0.05);
         p_.e0 = e0;
         p_.e1 = e1;
-        p_.nu_dp = nu_dp;
-        p_.e_dp = std::max(e_dp, 0.05); // same floor rationale as e_pass
+        p_.carbon_energy = carbon_energy;
 
-        // energy_lookup_ entries that depend on p_.e0 / p_.e1 must also be
-        // refreshed live. CARBON energies are looked up per-cell via
-        // carbon_species_energy[] instead, and are set independently via
-        // set_carbon_species_energy().
+        // energy_lookup_ entries that depend on p_.e0 / p_.e1 / p_.carbon_energy
+        // must all be refreshed live -- mirrors Python's update_params exactly.
         energy_lookup_[DEPOSITED][DEPOSITED] = p_.e0;
         energy_lookup_[DEPOSITED][SUBSTRATE] = p_.e1;
         energy_lookup_[SUBSTRATE][DEPOSITED] = p_.e1;
@@ -1325,6 +1289,13 @@ public:
         energy_lookup_[PASSIVATED][PASSIVATED] = p_.e0;
         energy_lookup_[PASSIVATED][SUBSTRATE] = p_.e1;
         energy_lookup_[SUBSTRATE][PASSIVATED] = p_.e1;
+        energy_lookup_[FREE][CARBON] = p_.carbon_energy;
+        energy_lookup_[CARBON][FREE] = p_.carbon_energy;
+        energy_lookup_[DEPOSITED][CARBON] = p_.carbon_energy;
+        energy_lookup_[CARBON][DEPOSITED] = p_.carbon_energy;
+        energy_lookup_[PASSIVATED][CARBON] = p_.carbon_energy;
+        energy_lookup_[CARBON][PASSIVATED] = p_.carbon_energy;
+
         // Important: old rates are now invalid
         parameters_changed_ = true;
     }
@@ -1345,13 +1316,11 @@ public:
     // each user-drawn carbon cell after init_simulation(), then call
     // finalize_carbon_placement() once at the end -- rebuilding the rate
     // table per-cell would be wasteful for a large drawn region.
-    void set_carbon_site(int x, int y, int species)
+    void set_carbon_site(int x, int y)
     {
         if (x < 0 || x >= p_.Nx || y < 0 || y >= p_.Ny)
             return;
         at(x, y) = CARBON;
-        int sp = std::max(0, std::min(species, MAX_CARBON_SPECIES - 1));
-        carbon_species_[y * p_.Nx + x] = (int8_t)sp;
     }
 
     // Reverts a cell that was previously marked carbon back to EMPTY.
@@ -1365,21 +1334,7 @@ public:
         if (at(x, y) == CARBON)
         {
             at(x, y) = EMPTY;
-            carbon_species_[y * p_.Nx + x] = -1;
         }
-    }
-
-    void set_carbon_species_energy(int species, double energy)
-    {
-        if (species < 0 || species >= MAX_CARBON_SPECIES)
-            return;
-        p_.carbon_species_energy[species] = energy;
-        parameters_changed_ = true;
-    }
-
-    const int8_t *carbon_species_data() const
-    {
-        return carbon_species_.data();
     }
 
     void finalize_carbon_placement()
@@ -1413,10 +1368,7 @@ public:
                 << "\"substrate\":" << s.substrate << ","
                 << "\"fill\":" << s.fill << ","
                 << "\"total_rate\":" << json_safe(s.total_rate) << ","
-                << "\"e_pass_used\":" << json_safe(s.e_pass_used) << ","
-                << "\"nu_p_used\":" << json_safe(s.nu_p_used) << ","
-                << "\"e_dp_used\":" << json_safe(s.e_dp_used) << ","
-                << "\"nu_dp_used\":" << json_safe(s.nu_dp_used)
+                << "\"nu_p_used\":" << json_safe(s.nu_p_used)
                 << "}";
 
             if(i + 1 < stats_history_.size())
@@ -1563,10 +1515,7 @@ private:
             substrate,
             fill_percentage(),
             total_rate,
-            p_.e_pass,
-            p_.nu_p,
-            p_.e_dp,
-            p_.nu_dp
+            p_.nu_p
         });
 
         // Prevent unbounded memory growth on indefinite/very long runs:
@@ -1795,7 +1744,6 @@ private:
     std::chrono::steady_clock::time_point wall_start_;
 
     std::vector<int8_t> lattice_; // [y*Nx + x]
-    std::vector<int8_t> carbon_species_; // [y*Nx + x], -1 = not carbon
     double energy_lookup_[6][6];
     int num_drop_;
     int num_hop_;
@@ -1876,9 +1824,7 @@ extern "C"
         double nu_f,
         double nu_d,
         double nu_p,
-        double e_pass,
-        double nu_dp,
-        double e_dp,
+        double carbon_energy,
         int seed)
     {
         wasm_params.Nx = Nx;
@@ -1889,33 +1835,11 @@ extern "C"
         wasm_params.e1 = e1;
         wasm_params.nu_f = nu_f;
         wasm_params.nu_d = nu_d;
-        // enable passivation
         wasm_params.nu_p = nu_p;
-        // Same floor as update_params(), applied here too since
-        // set_params() is the other entry point that sets e_pass.
-        wasm_params.e_pass = std::max(e_pass, 0.05);
-        wasm_params.nu_dp = nu_dp;
-        wasm_params.e_dp = std::max(e_dp, 0.05);
+        wasm_params.carbon_energy = carbon_energy;
         wasm_params.rng_seed = seed;
 
         wasm_params.pcg.seed((uint64_t)seed);
-    }
-
-    EMSCRIPTEN_KEEPALIVE
-    void set_carbon_species_energy(int species, double energy)
-    {
-        // Applies to whatever's currently active: the running sim if one
-        // exists, and wasm_params so a fresh init_simulation() picks it up.
-        if (species >= 0 && species < MAX_CARBON_SPECIES)
-            wasm_params.carbon_species_energy[species] = energy;
-        if (wasm_sim)
-            wasm_sim->set_carbon_species_energy(species, energy);
-    }
-
-    EMSCRIPTEN_KEEPALIVE
-    const int8_t *get_carbon_species_grid()
-    {
-        return wasm_sim ? wasm_sim->carbon_species_data() : nullptr;
     }
 
     EMSCRIPTEN_KEEPALIVE
@@ -1925,11 +1849,9 @@ extern "C"
         double nu_f,
         double nu_d,
         double nu_p,
-        double e_pass,
         double e0,
         double e1,
-        double nu_dp,
-        double e_dp
+        double carbon_energy
     )
     {
         if (!wasm_sim)
@@ -1941,11 +1863,9 @@ extern "C"
             nu_f,
             nu_d,
             nu_p,
-            e_pass,
             e0,
             e1,
-            nu_dp,
-            e_dp
+            carbon_energy
         );
     }
 
@@ -1971,10 +1891,10 @@ extern "C"
     }
 
     EMSCRIPTEN_KEEPALIVE
-    void mark_carbon(int x, int y, int species)
+    void mark_carbon(int x, int y)
     {
         if (wasm_sim)
-            wasm_sim->set_carbon_site(x, y, species);
+            wasm_sim->set_carbon_site(x, y);
     }
 
     EMSCRIPTEN_KEEPALIVE
@@ -2296,12 +2216,9 @@ extern "C"
         int seed,
         double nu_f,
         double nu_d,
-        double nu_p,
-        double e_pass,
-        double nu_dp,
-        double e_dp)
+        double nu_p)
     {
-        KMCParams p = wasm_params; // inherit carbon energies, etc.
+        KMCParams p = wasm_params; // inherit carbon_energy, etc.
         p.Nx = nx;
         p.Ny = ny;
         p.d0 = d0;
@@ -2311,9 +2228,6 @@ extern "C"
         p.nu_f = nu_f;
         p.nu_d = nu_d;
         p.nu_p = nu_p;
-        p.e_pass = std::max(e_pass, 0.05);
-        p.nu_dp = nu_dp;
-        p.e_dp = std::max(e_dp, 0.05);
         p.rng_seed = seed;
         p.pcg.seed((uint64_t)seed);
 
@@ -2394,34 +2308,23 @@ extern "C"
         int base_seed,
         double nu_f,
         double nu_d,
-        double nu_p,
-        double e_pass,
-        double nu_dp,
-        double e_dp)
+        double nu_p)
     {
         std::ostringstream json;
         json << "[";
 
         for (int i = 0; i < num_runs; i++)
         {
-            KMCParams p = wasm_params; // inherit carbon energies, etc.
+            KMCParams p = wasm_params; // inherit carbon_energy, etc.
             p.Nx = nx;
             p.Ny = ny;
             p.d0 = d0_arr[i];
             p.T = T_arr[i];
             p.e0 = e0_arr[i];
             p.e1 = e1_arr[i];
-            // Previously these came only from wasm_params (last set_params()
-            // call, i.e. the last time the main Run button was pressed) --
-            // meaning Batch Run silently ignored the current hop/passivation
-            // sliders unless you'd just run the main sim with matching
-            // values. Now explicit, same as set_params/update_params.
             p.nu_f = nu_f;
             p.nu_d = nu_d;
             p.nu_p = nu_p;
-            p.e_pass = std::max(e_pass, 0.05);
-            p.nu_dp = nu_dp;
-            p.e_dp = std::max(e_dp, 0.05);
             p.rng_seed = base_seed + i;
             p.pcg.seed((uint64_t)p.rng_seed);
 
