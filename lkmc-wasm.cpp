@@ -3,6 +3,18 @@
  *
  * WASM version of C++ port of LKMC_v2_commented_b.py.
  *
+ * v2 update (2026-09-27):
+ *   Fixed pre-hop destination energy evaluation. The moving atom's hypothetical
+ *   FREE/DEPOSITED state is now determined from the destination neighborhood
+ *   before e_final is calculated, without requiring the empty destination site
+ *   to already contain the atom.
+ *   Fixed RNG initialization so rng_seed now determines the PCG64 sequence for
+ *   native, configuration-file, WASM, and batch runs.
+ *   Fixed fill percentage so permanently unavailable SUBSTRATE and CARBON sites
+ *   are excluded from the denominator.
+ *   Added centralized parameter validation before allocation/rate calculation
+ *   to reject values that could overflow, divide by zero, or corrupt KMC rates.
+ *
  *  * Build:
  * em++ lkmc-wasm.cpp -o public/lkmc-wasm.js -O3 -std=c++17 -fexceptions -sINITIAL_MEMORY=268435456 -sALLOW_MEMORY_GROWTH=1 -sEXPORT_ES6=1 -sMODULARIZE=1 -sEXPORTED_FUNCTIONS="['_set_params','_update_simulation_params','_init_simulation','_mark_carbon','_unmark_carbon','_finalize_carbon_placement','_run_steps','_get_lattice_data','_get_width','_get_stats_json','_get_stats_json_len','_get_height','_get_lattice','_get_lattice_size','_get_fill','_get_passivated','_get_step','_get_time','_get_wall_time','_play','_pause','_stop','_step_once','_playback_tick','_set_batch_size','_set_stats_interval','_get_stats_interval','_get_playback_state','_get_terminated','_get_cell_coordination','_get_snapshot_count','_get_snapshot_step','_get_snapshot_lattice','_save_state','_get_save_state_len','_load_state','_peek_state_dimensions','_run_batch','_run_batch_begin','_run_batch_single','_run_batch_end','_get_batch_json','_cleanup_simulation','_force_update_frontend','_malloc','_free']" -sEXPORTED_RUNTIME_METHODS="['ccall','cwrap','HEAP8','HEAPU8','HEAP32','HEAPF64','wasmMemory']" -sALLOW_TABLE_GROWTH=1
  * Exported WASM stuff:
@@ -60,6 +72,7 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <map>
 #include <optional>
 #include <queue>
@@ -232,9 +245,9 @@ struct KMCParams
     double stop_fill_fraction = -1.0;
     int stop_fill_total_sites = 0;
     int rng_seed = 394583;
-    // PCG64 state — use get_pcg64_state.py to generate for any numpy seed.
-    // Defaults match numpy.random.default_rng(394583).
-    PCG64State pcg = {}; // default-constructed to seed=394583 values
+    // Explicit PCG64 state fields remain available for exact state imports.
+    // Normal initialization derives this state from rng_seed.
+    PCG64State pcg = {};
     bool periodic_x = true;
     int log_every = 1000;
     int snapshot_every = 100;
@@ -242,6 +255,17 @@ struct KMCParams
     bool save_npy = true;
     std::string output_dir = "kmc_output";
     std::string history_filename = "time_series.csv";
+
+    KMCParams()
+    {
+        set_rng_seed(rng_seed);
+    }
+
+    void set_rng_seed(int seed)
+    {
+        rng_seed = seed;
+        pcg.seed(static_cast<uint64_t>(seed));
+    }
 };
 
 // Parse a simple "key = value" config file.
@@ -328,6 +352,9 @@ KMCParams load_config(const std::string &path, KMCParams p = {})
             p.max_steps = toInt(val, p.max_steps);
         else if (key == "max_time")
             p.max_time = toDouble(val, p.max_time);
+
+        else if (key == "rng_seed")
+            p.set_rng_seed(toInt(val, p.rng_seed));
 
         else if (key == "pcg_state_hi")
             p.pcg.state_hi = toHex(val, p.pcg.state_hi);
@@ -479,25 +506,90 @@ public:
     // incremental Fenwick-tree updates over long runs.
     static constexpr int kRebuildInterval = 50000;
 
-    explicit ElectrodepositionKMC(const KMCParams &p)
-        : p_(p),
-          rng_(p.pcg),
-          lattice_(p.Ny * p.Nx, EMPTY),
-          num_drop_(p.Nx),
-          num_hop_(p.Nx * p.Ny * kEventsPerSite),
-          max_events_(p.Nx + p.Nx * p.Ny * kEventsPerSite),
-          event_rates_(p.Nx + p.Nx * p.Ny * kEventsPerSite, 0.0),
-          ftree_(p.Nx + p.Nx * p.Ny * kEventsPerSite),
-          idx_to_event_(p.Nx + p.Nx * p.Ny * kEventsPerSite)
+    static KMCParams validate_parameters(const KMCParams &p)
     {
-        // Validate.
-        if (p_.Nx < 1)
+        if (p.Nx < 1)
             throw std::invalid_argument("Nx must be >= 1.");
-        if (p_.Ny < 2)
+        if (p.Ny < 2)
             throw std::invalid_argument("Ny must be >= 2.");
-        if (p_.T <= 0)
-            throw std::invalid_argument("T must be positive.");
+        if (p.Nx > std::numeric_limits<int16_t>::max() ||
+            p.Ny > std::numeric_limits<int16_t>::max())
+        {
+            throw std::invalid_argument(
+                "Nx and Ny must be <= 32767 because event coordinates use int16_t."
+            );
+        }
 
+        const int64_t site_count =
+            static_cast<int64_t>(p.Nx) * static_cast<int64_t>(p.Ny);
+        const int64_t event_count =
+            static_cast<int64_t>(p.Nx) + site_count * kEventsPerSite;
+        if (event_count > std::numeric_limits<int>::max())
+        {
+            throw std::invalid_argument(
+                "Lattice dimensions create too many events for 32-bit indexing."
+            );
+        }
+
+        auto require_finite = [](double value, const char *name)
+        {
+            if (!std::isfinite(value))
+                throw std::invalid_argument(std::string(name) + " must be finite.");
+        };
+        auto require_nonnegative = [&](double value, const char *name)
+        {
+            require_finite(value, name);
+            if (value < 0.0)
+                throw std::invalid_argument(std::string(name) + " must be >= 0.");
+        };
+
+        require_finite(p.T, "T");
+        if (p.T <= 0.0)
+            throw std::invalid_argument("T must be > 0.");
+        require_finite(p.kB, "kB");
+        if (p.kB <= 0.0)
+            throw std::invalid_argument("kB must be > 0.");
+
+        require_nonnegative(p.d0, "d0");
+        require_nonnegative(p.nu_f, "nu_f");
+        require_nonnegative(p.nu_d, "nu_d");
+        require_nonnegative(p.nu_p, "nu_p");
+        require_finite(p.e0, "e0");
+        require_finite(p.e1, "e1");
+        require_finite(p.carbon_energy, "carbon_energy");
+
+        if (p.max_steps < 0)
+            throw std::invalid_argument("max_steps must be >= 0.");
+        require_finite(p.max_time, "max_time");
+        if (p.max_time < 0.0)
+            throw std::invalid_argument("max_time must be >= 0.");
+        if (p.log_every <= 0)
+            throw std::invalid_argument("log_every must be >= 1.");
+        if (p.snapshot_every <= 0)
+            throw std::invalid_argument("snapshot_every must be >= 1.");
+
+        require_finite(p.stop_fill_fraction, "stop_fill_fraction");
+        if (p.stop_fill_fraction > 1.0)
+            throw std::invalid_argument("stop_fill_fraction must be <= 1.");
+        if (p.output_dir.empty())
+            throw std::invalid_argument("output_dir must not be empty.");
+        if (p.history_filename.empty())
+            throw std::invalid_argument("history_filename must not be empty.");
+
+        return p;
+    }
+
+    explicit ElectrodepositionKMC(const KMCParams &p)
+        : p_(validate_parameters(p)),
+          rng_(p_.pcg),
+          lattice_(static_cast<size_t>(p_.Ny) * p_.Nx, EMPTY),
+          num_drop_(p_.Nx),
+          num_hop_(p_.Nx * p_.Ny * kEventsPerSite),
+          max_events_(p_.Nx + p_.Nx * p_.Ny * kEventsPerSite),
+          event_rates_(p_.Nx + p_.Nx * p_.Ny * kEventsPerSite, 0.0),
+          ftree_(p_.Nx + p_.Nx * p_.Ny * kEventsPerSite),
+          idx_to_event_(p_.Nx + p_.Nx * p_.Ny * kEventsPerSite)
+    {
         wall_start_ = std::chrono::steady_clock::now();
 
         // Substrate row (row 0).
@@ -514,8 +606,8 @@ public:
         energy_lookup_[PASSIVATED][PASSIVATED] = p_.e0;
         energy_lookup_[PASSIVATED][SUBSTRATE] = p_.e1;
         energy_lookup_[SUBSTRATE][PASSIVATED] = p_.e1;
-        energy_lookup_[FREE][CARBON] = p_.carbon_energy;
-        energy_lookup_[CARBON][FREE] = p_.carbon_energy;
+	//        energy_lookup_[FREE][CARBON] = p_.carbon_energy;
+	//        energy_lookup_[CARBON][FREE] = p_.carbon_energy;
         energy_lookup_[DEPOSITED][CARBON] = p_.carbon_energy;
         energy_lookup_[CARBON][DEPOSITED] = p_.carbon_energy;
         energy_lookup_[PASSIVATED][CARBON] = p_.carbon_energy;
@@ -906,6 +998,26 @@ private:
         return p_.e0 * coordination;
     }
 
+    // Determine the state a hypothetical mobile atom would have at a site.
+    // Unlike desired_bond_state(), this does not inspect the site's current
+    // occupancy, so it can be used while an empty site is evaluated as a hop
+    // destination.
+    int8_t desired_mobile_state_at_site(int x, int y) const
+    {
+        bool bonded = false;
+        for_each_neighbour(x, y, [&](int nx, int ny)
+        {
+            int8_t neighbor = at(nx, ny);
+            if (neighbor == DEPOSITED ||
+                neighbor == SUBSTRATE ||
+                neighbor == CARBON)
+            {
+                bonded = true;
+            }
+        });
+        return bonded ? DEPOSITED : FREE;
+    }
+
     // Rate formulas below mirror LKMC_v5_gui_fast.py's Numba kernel
     // (_nb_get_event_rate) exactly -- the Python file is the source of
     // truth for simulation physics. No custom barriers, no exposure
@@ -956,9 +1068,9 @@ private:
         int8_t old = const_cast<ElectrodepositionKMC *>(this)->at(x0, y0);
         const_cast<ElectrodepositionKMC *>(this)->at(x0, y0) = EMPTY;
 
-        // desired_bond_state (FREE vs DEPOSITED) at destination, mirroring
-        // Python's _nb_desired_mobile_state.
-        int8_t final_type = desired_bond_state(x1, y1);
+        // Determine the moving atom's hypothetical state at the empty
+        // destination before evaluating its final local energy.
+        int8_t final_type = desired_mobile_state_at_site(x1, y1);
         double e_final = calc_local_energy(x1, y1, final_type);
 
         const_cast<ElectrodepositionKMC *>(this)->at(x0, y0) = old;
@@ -1072,14 +1184,7 @@ private:
         int8_t st = at(x, y);
         if (st != FREE && st != DEPOSITED)
             return st;
-        bool bonded = false;
-        for_each_neighbour(x, y, [&](int nx, int ny)
-                           {
-                if (at(nx, ny) == DEPOSITED ||
-                    at(nx, ny) == SUBSTRATE ||
-                    at(nx, ny) == CARBON)
-                    bonded = true; });
-        return bonded ? DEPOSITED : FREE;
+        return desired_mobile_state_at_site(x, y);
     }
 
     void update_bonding_relaxation(
@@ -1151,7 +1256,9 @@ public:
         }
         double r_tot = ftree_.total();
 #ifndef __EMSCRIPTEN__
-        if(step_ % 100 == 0)
+        // Respect the configured logging interval. Printing every 100 steps
+        // floods subprocess-driven GUIs and can starve their event loops.
+        if(step_ % p_.log_every == 0)
         {
             printf(
                 "STEP %d RATE %.6e TIME %.6e FILL %.3f%%\n",
@@ -1278,14 +1385,16 @@ public:
         double carbon_energy
     )
     {
-        p_.d0 = d0;
-        p_.T = T;
-        p_.nu_f = nu_f;
-        p_.nu_d = nu_d;
-        p_.nu_p = nu_p;
-        p_.e0 = e0;
-        p_.e1 = e1;
-        p_.carbon_energy = carbon_energy;
+        KMCParams updated = p_;
+        updated.d0 = d0;
+        updated.T = T;
+        updated.nu_f = nu_f;
+        updated.nu_d = nu_d;
+        updated.nu_p = nu_p;
+        updated.e0 = e0;
+        updated.e1 = e1;
+        updated.carbon_energy = carbon_energy;
+        p_ = validate_parameters(updated);
 
         // energy_lookup_ entries that depend on p_.e0 / p_.e1 / p_.carbon_energy
         // must all be refreshed live -- mirrors Python's update_params exactly.
@@ -1390,21 +1499,27 @@ public:
     }
     double fill_percentage() const
     {
-        int deposited = 0;
+        int occupied_sites = 0;
+        int available_sites = 0;
 
         for (auto v : lattice_)
         {
+            if (v == SUBSTRATE || v == CARBON)
+                continue;
+
+            available_sites++;
             if (
                 v == FREE ||
                 v == DEPOSITED ||
                 v == PASSIVATED
             )
-                deposited++;
+                occupied_sites++;
         }
 
-        int total_sites = p_.Nx * p_.Ny;
+        if (available_sites == 0)
+            return 0.0;
 
-        return 100.0 * deposited / total_sites;
+        return 100.0 * occupied_sites / available_sites;
     }
     void play()
     {
@@ -1846,9 +1961,7 @@ extern "C"
         wasm_params.nu_d = nu_d;
         wasm_params.nu_p = nu_p;
         wasm_params.carbon_energy = carbon_energy;
-        wasm_params.rng_seed = seed;
-
-        wasm_params.pcg.seed((uint64_t)seed);
+        wasm_params.set_rng_seed(seed);
     }
 
     EMSCRIPTEN_KEEPALIVE
@@ -2237,8 +2350,7 @@ extern "C"
         p.nu_f = nu_f;
         p.nu_d = nu_d;
         p.nu_p = nu_p;
-        p.rng_seed = seed;
-        p.pcg.seed((uint64_t)seed);
+        p.set_rng_seed(seed);
 
         if (!g_batch_first_entry)
             g_batch_json_buf += ",";
@@ -2334,8 +2446,7 @@ extern "C"
             p.nu_f = nu_f;
             p.nu_d = nu_d;
             p.nu_p = nu_p;
-            p.rng_seed = base_seed + i;
-            p.pcg.seed((uint64_t)p.rng_seed);
+            p.set_rng_seed(base_seed + i);
 
             auto t0 = std::chrono::steady_clock::now();
             try
@@ -2471,7 +2582,7 @@ int main(int argc, char *argv[])
         }
         else if (arg == "--seed")
         {
-            params.rng_seed = std::stoi(argv[++i]);
+            params.set_rng_seed(std::stoi(argv[++i]));
         }
         else if (arg == "--p")
         {
