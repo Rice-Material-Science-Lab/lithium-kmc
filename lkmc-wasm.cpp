@@ -505,6 +505,8 @@ public:
     // correcting the floating-point drift that accumulates from
     // incremental Fenwick-tree updates over long runs.
     static constexpr int kRebuildInterval = 50000;
+    static constexpr double kExactRateLimit = 1e14;
+    bool rates_dirty_ = false;
 
     static KMCParams validate_parameters(const KMCParams &p)
     {
@@ -1110,6 +1112,12 @@ private:
             new_rate = 1e100;
         }
         double delta = new_rate - event_rates_[idx];
+        // Adding/removing a very large rate in the Fenwick tree loses the
+        // small rates (e.g. drops, ~d0) to floating-point cancellation; the
+        // running total can then drift to <= 0 and the sim falsely reports
+        // a jam. Flag it so the step ends with an exact rebuild.
+        if (std::abs(delta) > kExactRateLimit)
+            rates_dirty_ = true;
         if (std::abs(delta) > 1.0e-18)
         {
             event_rates_[idx] = new_rate;
@@ -1123,6 +1131,7 @@ private:
         ftree_.reset(max_events_);
         for (int i = 0; i < max_events_; ++i)
             update_rate_at(i);
+        rates_dirty_ = false;
     }
 
     // -----------------------------------------------------------------------
@@ -1271,6 +1280,13 @@ public:
 #endif
 
         constexpr double kMinRate = 1e-9;
+        if (r_tot <= kMinRate || !std::isfinite(r_tot))
+        {
+            // Never declare a jam from a drifted incremental total:
+            // recompute exactly first, and only stop if it's really zero.
+            rebuild_all_rates();
+            r_tot = ftree_.total();
+        }
         if (r_tot <= kMinRate)
         {
             int empty = 0;
@@ -1308,6 +1324,14 @@ public:
         int idx = ftree_.find_prefix_index(target);
         if (idx < 0) idx = 0;
         if (idx >= max_events_) idx = max_events_ - 1;
+
+        // Selected an event whose true rate is zero -> the tree has drifted.
+        // Rebuild and retry next call rather than executing an invalid event.
+        if (event_rates_[idx] <= 0.0)
+        {
+            rebuild_all_rates();
+            return true;
+        }
 
         const Event &ev = idx_to_event_[idx];
         step_directly_changed_.clear();
@@ -1366,6 +1390,8 @@ public:
         step_all_changed_.insert(step_all_changed_.end(),
                                   relax_changed_.begin(), relax_changed_.end());
         refresh_local_rates(step_all_changed_);
+        if (rates_dirty_)
+            rebuild_all_rates();
         time_ += dt;
         ++step_;
         if(step_ % stats_interval_ == 0)
@@ -1462,9 +1488,9 @@ public:
         }
     }
 
-    // redo bonding relaxation around edited cells and rebuild rates table
-    // a free atom next to new carbon must become deposited
-    // (and one that lost its only carbon neighbor must go back to free).
+    // Re-run bonding relaxation around every edited cell before rebuilding:
+    // a FREE atom next to new carbon must become DEPOSITED (and one that
+    // lost its only carbon neighbour must revert to FREE).
     void finalize_carbon_placement()
     {
         if (!pending_carbon_changes_.empty())
@@ -1475,29 +1501,25 @@ public:
         rebuild_all_rates();
     }
 
-    // parallel carbon columns on the substrate - random in [min_h, max_h], top two rows empty b/c cap
-    int add_graphite_lattice(int min_h, int max_h, uint32_t seed)
+    // Vertical, parallel carbon columns on the substrate, one empty lattice
+    // column between each, all `height` atoms tall (capped so the top two
+    // rows stay free). Fixed layout -- mirrors graphite_column_sites().
+    int add_graphite_lattice(int height)
     {
-        int lo = std::max(1, std::min(min_h, max_h));
-        int hi = std::max(lo, max_h);
-        int cap = std::max(0, p_.Ny - 3);
-        std::mt19937 gen(seed);
-        std::uniform_int_distribution<int> dist(lo, hi);
+        int h = std::min(std::max(1, height), std::max(1, p_.Ny - 3));
         int last = ((p_.Nx - 1) / 2) * 2;
         if (p_.periodic_x && last > 0 && (p_.Nx - last) <= 1)
             last -= 2;
         int placed = 0;
         for (int x = 0; x <= last; x += 2)
-        {
-            int h = std::min(dist(gen), cap);
             for (int y = 1; y <= h; ++y)
                 if (set_carbon_site(x, y))
                     ++placed;
-        }
         finalize_carbon_placement();
         return placed;
     }
-    // Guarantees a JSON compat. token - never gives nan/inf so parse doesn't break
+    // Guarantees a JSON-safe number token -- never emits nan/inf, which
+    // are invalid JSON and break JSON.parse on the frontend.
     static double json_safe(double v)
     {
         return std::isfinite(v) ? v : 0.0;
@@ -2072,9 +2094,9 @@ extern "C"
     }
 
     EMSCRIPTEN_KEEPALIVE
-    int add_graphite_lattice(int min_h, int max_h, int seed)
+    int add_graphite_lattice(int height)
     {
-        return wasm_sim ? wasm_sim->add_graphite_lattice(min_h, max_h, (uint32_t)seed) : 0;
+        return wasm_sim ? wasm_sim->add_graphite_lattice(height) : 0;
     }
 
     EMSCRIPTEN_KEEPALIVE
