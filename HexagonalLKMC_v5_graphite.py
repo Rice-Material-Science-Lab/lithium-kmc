@@ -118,6 +118,22 @@ def hex_axis_limits(Nx: int, Ny: int) -> Tuple[Tuple[float, float], Tuple[float,
     y_max = (Ny - 1) * row_step
     return (-radius, x_max + radius), (-radius, y_max + radius)
 
+def graphite_column_sites(
+    Nx: int, Ny: int, height: int = 15, gap: int = 1, periodic_x: bool = True,
+) -> List[Coord]:
+    """Fixed graphite lattice: vertical, parallel carbon columns standing on
+    the substrate (row 0), all `height` atoms tall (capped so the top two
+    rows stay free for drops). Columns sit at x = 0, gap+1, 2*(gap+1), ...
+    so there is `gap` empty lattice column between neighbours (default 1).
+    In the odd-r hex layout, same-x cells in consecutive rows are always
+    neighbours, so each column is a connected (slightly zig-zag) chain."""
+    h = min(max(1, height), max(1, Ny - 3))
+    xs = list(range(0, Nx, gap + 1))
+    # With periodic x, the last column must also keep a gap to column 0.
+    if periodic_x and len(xs) > 1 and (Nx - xs[-1]) <= gap:
+        xs.pop()
+    return [(x, y) for x in xs for y in range(1, 1 + h)]
+
 # ===========================================================================
 # Numba-compiled simulation kernel
 # ===========================================================================
@@ -903,13 +919,14 @@ class ElectrodepositionKMC:
         if self.p.save_snapshots:
             self.snapshot_dir.mkdir(parents=True, exist_ok=True)
 
-        self._cmap = ListedColormap(["white", "tab:blue", "tab:orange", "black", "tab:green"])
+        self._cmap = ListedColormap(["white", "tab:blue", "tab:orange", "black", "tab:green", "#DC2626"])
         self._fig  = None
         self._ax   = None
         self._im   = None
         self._title = None
 
         self.history: List = []
+        self._pending_carbon_changes: List[Coord] = []
         self._mem_snapshots: List[Tuple[int, float, np.ndarray]] = []
 
         # ── initial state ─────────────────────────────────────────────────
@@ -1213,12 +1230,19 @@ class ElectrodepositionKMC:
     # in-memory snapshot history, save/load state
     # ------------------------------------------------------------------
 
-    def set_carbon_site(self, x: int, y: int) -> None:
+    def set_carbon_site(self, x: int, y: int) -> bool:
         """Mark a lattice cell as a graphite anode site. Call once per
-        drawn cell, then finalize_carbon_placement() once at the end."""
+        drawn cell, then finalize_carbon_placement() once at the end.
+
+        Only EMPTY cells are converted: overwriting the substrate or an
+        existing atom would silently delete it. Returns True if placed."""
         if not (0 <= x < self.p.Nx and 0 <= y < self.p.Ny):
-            return
+            return False
+        if int(self.lattice[y, x]) != EMPTY:
+            return False
         self.lattice[y, x] = CARBON
+        self._pending_carbon_changes.append((x, y))
+        return True
 
     def unset_carbon_site(self, x: int, y: int) -> None:
         """Revert a previously-marked carbon cell back to EMPTY. No-op on
@@ -1227,11 +1251,25 @@ class ElectrodepositionKMC:
             return
         if int(self.lattice[y, x]) == CARBON:
             self.lattice[y, x] = EMPTY
+            self._pending_carbon_changes.append((x, y))
 
     def finalize_carbon_placement(self) -> None:
         """Rebuild rates once after a batch of carbon-site edits, instead
-        of once per cell."""
+        of once per cell. Also re-runs bonding relaxation around every
+        edited cell: a FREE atom next to new carbon must become DEPOSITED
+        (and one that just lost its only carbon neighbour must revert to
+        FREE), otherwise the lattice is left in an inconsistent state."""
+        if self._pending_carbon_changes:
+            self.update_bonding_relaxation(self._pending_carbon_changes)
+            self._pending_carbon_changes = []
         self.rebuild_all_rates()
+
+    def add_graphite_lattice(self, sites: Sequence[Coord]) -> int:
+        """Place a set of carbon sites (e.g. from graphite_column_sites())
+        and rebuild once. Occupied cells are skipped. Returns count placed."""
+        placed = sum(1 for (x, y) in sites if self.set_carbon_site(x, y))
+        self.finalize_carbon_placement()
+        return placed
 
     def update_params(self, **kwargs) -> None:
         """Live-update tunable parameters without reconstructing the sim.
@@ -1311,7 +1349,13 @@ class ElectrodepositionKMC:
 
     def execute_step(self) -> bool:
         r_tot = self.ftree.total()
-        if r_tot <= 0.0:
+        if r_tot <= 1e-9 or not math.isfinite(r_tot):
+            # Incremental Fenwick totals can drift to <= 0 after very large
+            # rates are added/removed (float cancellation). Recompute exactly
+            # before concluding that no event is possible.
+            self.rebuild_all_rates()
+            r_tot = self.ftree.total()
+        if r_tot <= 1e-9:
             return False
         u1 = max(float(self.rng.random()), 1.0e-15)
         dt = -math.log(u1) / r_tot
@@ -1439,10 +1483,14 @@ class ElectrodepositionKMC:
         ):
             self.validate_against_full_rebuild()
 
+        # Same drift guard for the compiled path: the kernel stops when the
+        # running total hits <= 0, which may be float drift, not a real jam.
+        if self.ftree.total() <= 1e-9:
+            self.rebuild_all_rates()
         finished = (
             self.step >= self.p.max_steps
             or self.time >= self.p.max_time
-            or self.ftree.total() <= 0.0
+            or self.ftree.total() <= 1e-9
         )
         return steps_done, finished
 
@@ -1515,14 +1563,14 @@ class ElectrodepositionKMC:
             edgecolors="#cfcfcf",
             linewidths=0.25,
         )
-        hexes.set_clim(0, 4)
+        hexes.set_clim(-0.5, 5.5)
         ax.add_collection(hexes)
         (xmin, xmax), (ymin, ymax) = hex_axis_limits(self.p.Nx, self.p.Ny)
         ax.set_xlim(xmin, xmax)
         ax.set_ylim(ymin, ymax)
         ax.set_aspect("equal", adjustable="box")
-        cbar = fig.colorbar(hexes, ax=ax, ticks=[0, 1, 2, 3, 4], fraction=0.046, pad=0.04)
-        cbar.ax.set_yticklabels(["Empty", "Free", "Deposited", "Substrate", "Passivated"])
+        cbar = fig.colorbar(hexes, ax=ax, ticks=[0, 1, 2, 3, 4, 5], fraction=0.046, pad=0.04)
+        cbar.ax.set_yticklabels(["Empty", "Free", "Deposited", "Substrate", "Passivated", "Carbon"])
         cbar.ax.tick_params(labelsize=9)
         ax.set_xlabel("x  (lattice site)", fontsize=10)
         ax.set_ylabel("y  (lattice site)", fontsize=10)
@@ -1552,7 +1600,7 @@ class ElectrodepositionKMC:
             edgecolors="#cfcfcf",
             linewidths=0.25,
         )
-        self._im.set_clim(0, 4)
+        self._im.set_clim(-0.5, 5.5)
         self._ax.add_collection(self._im)
         (xmin, xmax), (ymin, ymax) = hex_axis_limits(self.p.Nx, self.p.Ny)
         self._ax.set_xlim(xmin, xmax)
@@ -1699,6 +1747,7 @@ class SimulationGUI:
         self.drawing_carbon_var = tk.BooleanVar(value=False)
         self.carbon_energy_var  = tk.DoubleVar(value=self.params.carbon_energy)
         self._carbon_sites: dict = {}   # (x, y) -> True, pre-run preview + replay-on-start
+        self.graphite_height_var = tk.IntVar(value=15)
         self._history_mode      = False
         self._batch_results: List[dict] = []
 
@@ -2029,11 +2078,12 @@ class SimulationGUI:
         legend_frame = ttk.Frame(frame)
         legend_frame.grid(row=len(stats), column=0, columnspan=2, pady=(6, 4), padx=8, sticky="w")
         for color, text in [
-            ("white",    "Empty"),
+            ("#111111",  "Empty"),
             ("#5599dd",  "Free"),
             ("#dd8833",  "Deposited"),
             ("#222222",  "Substrate"),
             ("#66bb6a",  "Passivated"),
+            ("#DC2626",  "Carbon"),
         ]:
             tk.Label(legend_frame, text="●", fg=color,
                      bg=self._colors["PANEL"], font=("Segoe UI", 11)).pack(side="left")
@@ -2054,17 +2104,75 @@ class SimulationGUI:
         entry.grid(row=1, column=1, padx=(0, 8), pady=2)
         entry.bind("<Return>", self._on_live_param_commit)
         entry.bind("<FocusOut>", self._on_live_param_commit)
+        ttk.Label(frame, text="Column height (atoms)", anchor="w").grid(
+            row=2, column=0, sticky="w", padx=(8, 4), pady=2)
+        ttk.Entry(frame, textvariable=self.graphite_height_var, width=13).grid(
+            row=2, column=1, padx=(0, 8), pady=2)
+        ttk.Button(frame, text="Add Graphite Lattice", command=self._add_graphite_lattice).grid(
+            row=4, column=0, columnspan=2, sticky="ew", padx=8, pady=(4, 2))
         ttk.Button(frame, text="Clear Carbon", command=self._clear_carbon).grid(
-            row=2, column=0, columnspan=2, sticky="ew", padx=8, pady=(2, 6))
+            row=5, column=0, columnspan=2, sticky="ew", padx=8, pady=(2, 6))
 
     def _clear_carbon(self) -> None:
         if self.sim is not None:
             for (cx, cy) in list(self._carbon_sites.keys()):
                 self.sim.unset_carbon_site(cx, cy)
             self.sim.finalize_carbon_placement()
+            self._carbon_sites.clear()
             self._refresh_lattice()
-            self.canvas.draw_idle()
-        self._carbon_sites.clear()
+        else:
+            self._carbon_sites.clear()
+            self._show_preview()
+        self.canvas.draw_idle()
+
+    # ── Carbon helpers ─────────────────────────────────────────────────
+
+    def _grid_dims(self) -> Tuple[int, int]:
+        """Dimensions of the lattice currently on screen: the running sim's,
+        or (before a run) whatever is typed in the Nx/Ny fields."""
+        if self.sim is not None:
+            return self.sim.p.Nx, self.sim.p.Ny
+        try:
+            nx = max(1, int(self.entries["Nx"][0].get()))
+            ny = max(2, int(self.entries["Ny"][0].get()))
+            return nx, ny
+        except ValueError:
+            return self.params.Nx, self.params.Ny
+
+    def _show_preview(self) -> None:
+        """Pre-run preview: substrate row + drawn carbon, at the Nx/Ny
+        currently entered (so carbon can be placed at the right size)."""
+        Nx, Ny = self._grid_dims()
+        preview = np.zeros((Ny, Nx), dtype=np.int8)
+        preview[0, :] = SUBSTRATE
+        for (px, py) in self._carbon_sites:
+            if 0 <= px < Nx and 1 <= py < Ny:
+                preview[py, px] = CARBON
+        self._im.set_verts(make_hex_vertices(Nx, Ny))
+        self._im.set_array(preview.ravel())
+        (xmin, xmax), (ymin, ymax) = hex_axis_limits(Nx, Ny)
+        self._ax_lat.set_xlim(xmin, xmax)
+        self._ax_lat.set_ylim(ymin, ymax)
+
+    def _hex_cell_at(self, xd: float, yd: float) -> Tuple[int, int]:
+        """Nearest hex-cell centre to a data-space click (checks the
+        candidate rows above/below, since rounding y alone misassigns
+        clicks near the zig-zag row boundaries)."""
+        radius = 1.0 / math.sqrt(3.0)
+        row_step = 1.5 * radius
+        Nx, Ny = self._grid_dims()
+        y0 = int(round(yd / row_step))
+        best, best_d = (0, 0), float("inf")
+        for y in (y0 - 1, y0, y0 + 1):
+            if not 0 <= y < Ny:
+                continue
+            off = 0.5 if y % 2 else 0.0
+            x = int(round(xd - off))
+            x = max(0, min(Nx - 1, x))
+            d = (xd - (x + off)) ** 2 + (yd - y * row_step) ** 2
+            if d < best_d:
+                best, best_d = (x, y), d
+        return best
 
     def _on_lattice_click(self, event) -> None:
         if not self.drawing_carbon_var.get():
@@ -2073,18 +2181,9 @@ class SimulationGUI:
             return
         if event.xdata is None or event.ydata is None:
             return
-        # Inverts the row/column layout used in make_hex_vertices(). NOTE:
-        # this hit-testing was written without being able to render and
-        # click-test it -- verify it lands on the cell you actually click,
-        # and adjust the rounding/offset below if it's off by one row/col.
-        radius = 1.0 / math.sqrt(3.0)
-        row_step = 1.5 * radius
-        Nx, Ny = self.params.Nx, self.params.Ny
-        y = int(round(event.ydata / row_step))
-        y = max(0, min(Ny - 1, y))
-        row_offset = 0.5 if y % 2 else 0.0
-        x = int(round(event.xdata - row_offset))
-        x = max(0, min(Nx - 1, x))
+        x, y = self._hex_cell_at(event.xdata, event.ydata)
+        if y == 0:
+            return      # row 0 is substrate, never carbon
 
         key = (x, y)
         if key in self._carbon_sites:
@@ -2092,20 +2191,51 @@ class SimulationGUI:
             if self.sim is not None:
                 self.sim.unset_carbon_site(x, y)
         else:
+            if self.sim is not None and not self.sim.set_carbon_site(x, y):
+                return  # cell occupied by an atom; don't delete it
             self._carbon_sites[key] = True
-            if self.sim is not None:
-                self.sim.set_carbon_site(x, y)
 
         if self.sim is not None:
             self.sim.finalize_carbon_placement()
             self._refresh_lattice()
         else:
-            # Pre-run preview: overlay carbon marks on a blank lattice.
-            preview = np.zeros((Ny, Nx), dtype=np.int8)
-            for (px, py) in self._carbon_sites:
-                preview[py, px] = CARBON
-            self._im.set_array(preview.ravel())
+            self._show_preview()
         self.canvas.draw_idle()
+
+    def _add_graphite_lattice(self) -> None:
+        """Add vertical, parallel carbon columns (one empty lattice column
+        between each) standing on the substrate."""
+        try:
+            height = int(self.graphite_height_var.get())
+        except (tk.TclError, ValueError):
+            messagebox.showerror("Invalid input", "Column height must be an integer.")
+            return
+        if height < 1:
+            messagebox.showerror("Invalid input", "Column height must be at least 1.")
+            return
+        Nx, Ny = self._grid_dims()
+        periodic = bool(self.sim.p.periodic_x) if self.sim is not None else self._entry_periodic()
+        sites = graphite_column_sites(Nx, Ny, height, gap=1, periodic_x=periodic)
+        if height > Ny - 3:
+            self._status_var.set(f"Column height capped at {max(1, Ny - 3)} (lattice height {Ny}).")
+
+        if self.sim is not None:
+            for (x, y) in sites:
+                if self.sim.set_carbon_site(x, y):
+                    self._carbon_sites[(x, y)] = True
+            self.sim.finalize_carbon_placement()
+            self._refresh_lattice()
+        else:
+            for site in sites:
+                self._carbon_sites[site] = True
+            self._show_preview()
+        self.canvas.draw_idle()
+
+    def _entry_periodic(self) -> bool:
+        try:
+            return bool(int(self.entries["periodic_x"][0].get()))
+        except ValueError:
+            return self.params.periodic_x
 
     def _build_plot_area(self, parent: ttk.Frame) -> None:
         C = self._colors
@@ -2127,15 +2257,15 @@ class SimulationGUI:
             edgecolors="#313244",
             linewidths=0.3,
         )
-        self._im.set_clim(0, 4)
+        self._im.set_clim(-0.5, 5.5)
         self._ax_lat.add_collection(self._im)
         (xmin, xmax), (ymin, ymax) = hex_axis_limits(self.params.Nx, self.params.Ny)
         self._ax_lat.set_xlim(xmin, xmax)
         self._ax_lat.set_ylim(ymin, ymax)
         self._ax_lat.set_aspect("equal", adjustable="box")
         cbar = self._fig.colorbar(self._im, ax=self._ax_lat,
-                                  ticks=[0, 1, 2, 3, 4], fraction=0.03, pad=0.02)
-        cbar.ax.set_yticklabels(["Empty", "Free", "Dep.", "Sub.", "Pass."])
+                                  ticks=[0, 1, 2, 3, 4, 5], fraction=0.03, pad=0.02)
+        cbar.ax.set_yticklabels(["Empty", "Free", "Dep.", "Sub.", "Pass.", "Carbon"])
         cbar.ax.tick_params(labelsize=7, colors=C["FG"])
         cbar.outline.set_edgecolor(C["ACC"])
 
@@ -2157,6 +2287,8 @@ class SimulationGUI:
         self.canvas.get_tk_widget().pack(fill="both", expand=True)
         self.canvas.draw()
         self.canvas.mpl_connect("button_press_event", self._on_lattice_click)
+        self._show_preview()
+        self.canvas.draw_idle()
 
         # Status bar
         self._status_var = tk.StringVar(value="Ready.")
@@ -2168,7 +2300,7 @@ class SimulationGUI:
 
     @staticmethod
     def _cmap_for_display():
-        return ListedColormap(["#111111", "#5599dd", "#dd8833", "#222222", "#66bb6a"])
+        return ListedColormap(["#111111", "#5599dd", "#dd8833", "#222222", "#66bb6a", "#DC2626"])
 
     # v3 change: helper for the GUI count-plot x-axis label.
     def _count_plot_xlabel(self) -> str:
