@@ -1434,11 +1434,17 @@ public:
     // each user-drawn carbon cell after init_simulation(), then call
     // finalize_carbon_placement() once at the end -- rebuilding the rate
     // table per-cell would be wasteful for a large drawn region.
-    void set_carbon_site(int x, int y)
+    // Only EMPTY cells are converted -- overwriting the substrate or an
+    // existing atom would silently delete it. Returns true if placed.
+    bool set_carbon_site(int x, int y)
     {
         if (x < 0 || x >= p_.Nx || y < 0 || y >= p_.Ny)
-            return;
+            return false;
+        if (at(x, y) != EMPTY)
+            return false;
         at(x, y) = CARBON;
+        pending_carbon_changes_.emplace_back(x, y);
+        return true;
     }
 
     // Reverts a cell that was previously marked carbon back to EMPTY.
@@ -1452,15 +1458,46 @@ public:
         if (at(x, y) == CARBON)
         {
             at(x, y) = EMPTY;
+            pending_carbon_changes_.emplace_back(x, y);
         }
     }
 
+    // redo bonding relaxation around edited cells and rebuild rates table
+    // a free atom next to new carbon must become deposited
+    // (and one that lost its only carbon neighbor must go back to free).
     void finalize_carbon_placement()
     {
+        if (!pending_carbon_changes_.empty())
+        {
+            update_bonding_relaxation(pending_carbon_changes_);
+            pending_carbon_changes_.clear();
+        }
         rebuild_all_rates();
     }
-    // Guarantees a JSON-safe number token -- never emits nan/inf, which
-    // are invalid JSON and break JSON.parse on the frontend.
+
+    // parallel carbon columns on the substrate - random in [min_h, max_h], top two rows empty b/c cap
+    int add_graphite_lattice(int min_h, int max_h, uint32_t seed)
+    {
+        int lo = std::max(1, std::min(min_h, max_h));
+        int hi = std::max(lo, max_h);
+        int cap = std::max(0, p_.Ny - 3);
+        std::mt19937 gen(seed);
+        std::uniform_int_distribution<int> dist(lo, hi);
+        int last = ((p_.Nx - 1) / 2) * 2;
+        if (p_.periodic_x && last > 0 && (p_.Nx - last) <= 1)
+            last -= 2;
+        int placed = 0;
+        for (int x = 0; x <= last; x += 2)
+        {
+            int h = std::min(dist(gen), cap);
+            for (int y = 1; y <= h; ++y)
+                if (set_carbon_site(x, y))
+                    ++placed;
+        }
+        finalize_carbon_placement();
+        return placed;
+    }
+    // Guarantees a JSON compat. token - never gives nan/inf so parse doesn't break
     static double json_safe(double v)
     {
         return std::isfinite(v) ? v : 0.0;
@@ -1890,6 +1927,7 @@ private:
     std::vector<std::pair<int, int>> relax_changed_;
 
     std::vector<std::pair<int, int>> step_directly_changed_;
+    std::vector<std::pair<int, int>> pending_carbon_changes_;
     std::vector<std::pair<int, int>> step_all_changed_;
 
     static constexpr size_t kMaxStatsRows = 5000;
@@ -2031,6 +2069,12 @@ extern "C"
     {
         if (wasm_sim)
             wasm_sim->finalize_carbon_placement();
+    }
+
+    EMSCRIPTEN_KEEPALIVE
+    int add_graphite_lattice(int min_h, int max_h, int seed)
+    {
+        return wasm_sim ? wasm_sim->add_graphite_lattice(min_h, max_h, (uint32_t)seed) : 0;
     }
 
     EMSCRIPTEN_KEEPALIVE
