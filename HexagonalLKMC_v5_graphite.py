@@ -796,6 +796,7 @@ class KMCParams:
     stop_fill_fraction: Optional[float] = None
     stop_fill_total_sites: Optional[int] = None
     carbon_energy: float = -0.6       # eV, graphite anode bond energy (single species)
+    intercalation_capacity: Optional[int] = None  # Stage 5: per gap-column Li capacity; None = derive from neighbouring carbon height (row count)
     mem_snapshot_every: int = 10_000  # steps between in-memory scrub snapshots
     max_mem_snapshots: int = 300
 
@@ -859,6 +860,7 @@ class ElectrodepositionKMC:
         if self.p.log_every      < 1: raise ValueError("log_every must be >= 1.")
         if self.p.snapshot_every < 1: raise ValueError("snapshot_every must be >= 1.")
         if self.p.gui_batch_steps < 1: raise ValueError("gui_batch_steps must be >= 1.")
+        if self.p.intercalation_capacity is not None and self.p.intercalation_capacity < 0: raise ValueError("intercalation_capacity must be >= 0 or None.")
 
         # ── lattice ───────────────────────────────────────────────────────
         self.lattice = np.zeros((self.p.Ny, self.p.Nx), dtype=np.int8)
@@ -1271,10 +1273,121 @@ class ElectrodepositionKMC:
         self.finalize_carbon_placement()
         return placed
 
+    # ------------------------------------------------------------------
+    # Stage 5: intercalation / capacity / plating (per-column counter)
+    # ------------------------------------------------------------------
+    # No new lattice value is introduced. Intercalated and plating atoms
+    # keep their existing FREE / DEPOSITED / PASSIVATED values, energies
+    # and rates. These counters are derived from the lattice on demand,
+    # so they cannot drift from it and cannot change the trajectory.
+    # A "gap channel column" is a non-carbon column with a carbon column
+    # as an immediate x-neighbour. Capacity is the number of y rows in
+    # which at least one neighbouring carbon column has a CARBON site
+    # (for uniform columns, exactly the column height), unless
+    # intercalation_capacity overrides it for every gap column.
+    # P_N (stage 4 measurement) = total plating atoms in gap columns.
+
+    def carbon_columns(self) -> List[int]:
+        cols = set()
+        for y in range(1, self.p.Ny):
+            for x in range(self.p.Nx):
+                if int(self.lattice[y, x]) == CARBON:
+                    cols.add(x)
+        return sorted(cols)
+
+    def gap_columns(self) -> List[int]:
+        carbon = set(self.carbon_columns())
+        gaps = []
+        for x in range(self.p.Nx):
+            if x in carbon:
+                continue
+            neighbours = []
+            if self.p.periodic_x:
+                neighbours = [(x - 1) % self.p.Nx, (x + 1) % self.p.Nx]
+            else:
+                if x - 1 >= 0:
+                    neighbours.append(x - 1)
+                if x + 1 < self.p.Nx:
+                    neighbours.append(x + 1)
+            if any(n in carbon for n in neighbours):
+                gaps.append(x)
+        return gaps
+
+    def column_capacity(self, x: int) -> int:
+        if x not in set(self.gap_columns()):
+            return 0
+        if self.p.intercalation_capacity is not None:
+            return int(self.p.intercalation_capacity)
+        carbon = set(self.carbon_columns())
+        neighbours = []
+        if self.p.periodic_x:
+            neighbours = [(x - 1) % self.p.Nx, (x + 1) % self.p.Nx]
+        else:
+            if x - 1 >= 0:
+                neighbours.append(x - 1)
+            if x + 1 < self.p.Nx:
+                neighbours.append(x + 1)
+        rows = 0
+        for y in range(1, self.p.Ny):
+            if any(int(self.lattice[y, n]) == CARBON for n in neighbours if n in carbon):
+                rows += 1
+        return rows
+
+    def column_atom_count(self, x: int) -> int:
+        return int(sum(1 for y in range(self.p.Ny)
+                       if int(self.lattice[y, x]) in (FREE, DEPOSITED, PASSIVATED)))
+
+    def intercalation_stats(self) -> dict:
+        gaps = self.gap_columns()
+        capacities, counts, intercalated, plating = [], [], [], []
+        saturated = []
+        for x in gaps:
+            cap = self.column_capacity(x)
+            n = self.column_atom_count(x)
+            capacities.append(cap)
+            counts.append(n)
+            intercalated.append(min(n, cap))
+            plating.append(max(0, n - cap))
+            if cap > 0 and n >= cap:
+                saturated.append(x)
+        return {
+            "gap_columns": gaps,
+            "capacities": capacities,
+            "counts": counts,
+            "intercalated": intercalated,
+            "plating": plating,
+            "intercalated_total": int(sum(intercalated)),
+            "plating_total": int(sum(plating)),
+            "saturated_columns": saturated,
+        }
+
+    def plating_count(self) -> int:
+        """P_N: total plating atoms in gap columns (excess over capacity)."""
+        return int(self.intercalation_stats()["plating_total"])
+
+    def classify_site(self, x: int, y: int) -> str:
+        """Inspection-only label for one site. Not a lattice value.
+        In a gap column, Li atoms ordered by increasing y are intercalated
+        up to capacity, plating beyond it. Elsewhere: 'surface' for a Li
+        atom, 'empty' / 'substrate' / 'carbon' for non-Li sites."""
+        v = int(self.lattice[y, x])
+        if v == CARBON:
+            return "carbon"
+        if v == SUBSTRATE:
+            return "substrate"
+        if v == EMPTY:
+            return "empty"
+        if x not in set(self.gap_columns()):
+            return "surface"
+        cap = self.column_capacity(x)
+        rank = sum(1 for yy in range(y + 1)
+                   if int(self.lattice[yy, x]) in (FREE, DEPOSITED, PASSIVATED))
+        return "intercalated" if rank <= cap else "plating"
+
     def update_params(self, **kwargs) -> None:
         """Live-update tunable parameters without reconstructing the sim.
         Only rate/energy fields are accepted; Nx/Ny cannot change here."""
-        live_tunable = {"T", "d0", "e0", "e1", "nu_f", "nu_d", "nu_p", "carbon_energy"}
+        live_tunable = {"T", "d0", "e0", "e1", "nu_f", "nu_d", "nu_p", "carbon_energy", "intercalation_capacity"}
         changed = False
         for key, value in kwargs.items():
             if key not in live_tunable:
@@ -1319,14 +1432,25 @@ class ElectrodepositionKMC:
         return None
 
     def save_state(self, path: Path) -> None:
-        """Pickle enough state to resume: params, step/time, lattice."""
+        """Pickle enough state to resume: params, step/time, lattice.
+
+        Stage 5 save format v2: adds save_format_version, the capacity
+        parameter, and per-column capacity / intercalated / plating lists.
+        Stored counters are audit-only; load_state() recomputes them from
+        the lattice, so they are authoritative and cannot drift."""
         import pickle
+        stats = self.intercalation_stats()
         with open(path, "wb") as f:
             pickle.dump({
+                "save_format_version": 2,
                 "params": self.p,
                 "step": self.step,
                 "time": self.time,
                 "lattice": self.lattice,
+                "intercalation_capacity": self.p.intercalation_capacity,
+                "column_capacity": stats["capacities"],
+                "column_intercalated": stats["intercalated"],
+                "column_plating": stats["plating"],
             }, f)
 
     @classmethod
@@ -1336,11 +1460,15 @@ class ElectrodepositionKMC:
         import pickle
         with open(path, "rb") as f:
             blob = pickle.load(f)
+        # v1 blobs have no save_format_version; they load exactly as
+        # before, and stage 5 counters are recomputed from the lattice.
+        # v2 blobs carry counters for audit, but recomputed counters win.
         sim = cls(blob["params"])
         sim.lattice[:, :] = blob["lattice"]
         sim.step = blob["step"]
         sim.time = blob["time"]
         sim.rebuild_all_rates()
+        _ = sim.intercalation_stats()
         return sim
 
     # ------------------------------------------------------------------

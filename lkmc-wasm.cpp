@@ -16,7 +16,7 @@
  *   to reject values that could overflow, divide by zero, or corrupt KMC rates.
  *
  *  * Build:
- * em++ lkmc-wasm.cpp -o public/lkmc-wasm.js -O3 -std=c++17 -fexceptions -sINITIAL_MEMORY=268435456 -sALLOW_MEMORY_GROWTH=1 -sEXPORT_ES6=1 -sMODULARIZE=1 -sEXPORTED_FUNCTIONS="['_set_params','_update_simulation_params','_init_simulation','_mark_carbon','_unmark_carbon','_finalize_carbon_placement','_run_steps','_get_lattice_data','_get_width','_get_stats_json','_get_stats_json_len','_get_height','_get_lattice','_get_lattice_size','_get_fill','_get_passivated','_get_step','_get_time','_get_wall_time','_play','_pause','_stop','_step_once','_playback_tick','_set_batch_size','_set_stats_interval','_get_stats_interval','_get_playback_state','_get_terminated','_get_cell_coordination','_get_snapshot_count','_get_snapshot_step','_get_snapshot_lattice','_save_state','_get_save_state_len','_load_state','_peek_state_dimensions','_run_batch','_run_batch_begin','_run_batch_single','_run_batch_end','_get_batch_json','_cleanup_simulation','_force_update_frontend','_malloc','_free']" -sEXPORTED_RUNTIME_METHODS="['ccall','cwrap','HEAP8','HEAPU8','HEAP32','HEAPF64','wasmMemory']" -sALLOW_TABLE_GROWTH=1
+ * em++ lkmc-wasm.cpp -o public/lkmc-wasm.js -O3 -std=c++17 -fexceptions -sINITIAL_MEMORY=268435456 -sALLOW_MEMORY_GROWTH=1 -sEXPORT_ES6=1 -sMODULARIZE=1 -sEXPORTED_FUNCTIONS="['_set_params','_update_simulation_params','_init_simulation','_mark_carbon','_unmark_carbon','_finalize_carbon_placement','_run_steps','_get_lattice_data','_get_width','_get_stats_json','_get_stats_json_len','_get_intercalation_json','_get_intercalation_json_len','_get_height','_get_lattice','_get_lattice_size','_get_fill','_get_passivated','_get_step','_get_time','_get_wall_time','_play','_pause','_stop','_step_once','_playback_tick','_set_batch_size','_set_stats_interval','_get_stats_interval','_get_playback_state','_get_terminated','_get_cell_coordination','_get_snapshot_count','_get_snapshot_step','_get_snapshot_lattice','_save_state','_get_save_state_len','_load_state','_peek_state_dimensions','_run_batch','_run_batch_begin','_run_batch_single','_run_batch_end','_get_batch_json','_cleanup_simulation','_force_update_frontend','_malloc','_free']" -sEXPORTED_RUNTIME_METHODS="['ccall','cwrap','HEAP8','HEAPU8','HEAP32','HEAPF64','wasmMemory']" -sALLOW_TABLE_GROWTH=1
  * Exported WASM stuff:
  *   _set_params(int Nx, int Ny, double d0, double T, double e0, double e1, double nu_f, double nu_d, double nu_p, double e_pass, double nu_dp, double e_dp, int seed)
  *   _update_simulation_params(double d0, double T, double nu_f, double nu_d, double nu_p, double e_pass, double e0, double e1, double nu_dp, double e_dp)
@@ -236,6 +236,7 @@ struct KMCParams
     double carbon_energy = -0.6; // eV — graphite anode bond energy (single
     // species, matches Python KMCParams.carbon_energy exactly). Baked into
     // energy_lookup_ like any other pair, not looked up separately.
+    int intercalation_capacity = -1; // Stage 5: per gap-column Li capacity; -1 = derive from neighbouring carbon height (row count), >=0 overrides
     double nu_f = 5e9;  // matches Python KMCParams default
     double nu_d = 5e9;  // matches Python KMCParams default
     double nu_p = 1e3;  // matches Python KMCParams default
@@ -375,6 +376,8 @@ KMCParams load_config(const std::string &path, KMCParams p = {})
             p.save_snapshots = (toInt(val, 1) != 0);
         else if (key == "save_npy")
             p.save_npy = (toInt(val, 1) != 0);
+        else if (key == "intercalation_capacity")
+            p.intercalation_capacity = toInt(val, p.intercalation_capacity);
 
         else if (key == "output_dir")
             p.output_dir = val;
@@ -754,23 +757,46 @@ public:
     // Serializes everything needed to resume a run: dimensions, step/time,
     // the raw lattice, and current params. Format is a flat buffer the
     // frontend can base64/store and hand back later.
+    // Stage 5 save format v2: magic "LKMC" + version 2, then Nx, Ny,
+    // step, time, intercalation_capacity, lattice, and per-column
+    // capacities (audit-only; restore recomputes them from the lattice).
+    // Blobs without the magic are the original v1 layout and still load.
     std::string serialize_state() const
     {
         std::ostringstream out(std::ios::binary);
         auto write = [&](const void *ptr, size_t n) {
             out.write(reinterpret_cast<const char *>(ptr), n);
         };
+        const char magic[4] = {'L', 'K', 'M', 'C'};
+        int32_t version = 2;
         int32_t nx = p_.Nx, ny = p_.Ny;
+        int32_t capacity = p_.intercalation_capacity;
+        write(magic, 4);
+        write(&version, sizeof(version));
         write(&nx, sizeof(nx));
         write(&ny, sizeof(ny));
         write(&step_, sizeof(step_));
         write(&time_, sizeof(time_));
+        write(&capacity, sizeof(capacity));
         write(lattice_.data(), lattice_.size());
+        for (int x = 0; x < p_.Nx; ++x)
+        {
+            int32_t cap = column_capacity(x);
+            write(&cap, sizeof(cap));
+        }
         return out.str();
     }
 
     static bool deserialize_dimensions(const std::string &blob, int &nx, int &ny)
     {
+        if (blob.size() >= 4 && blob.compare(0, 4, "LKMC") == 0)
+        {
+            if (blob.size() < 16)
+                return false;
+            memcpy(&nx, blob.data() + 8, sizeof(int32_t));
+            memcpy(&ny, blob.data() + 12, sizeof(int32_t));
+            return true;
+        }
         if (blob.size() < sizeof(int32_t) * 2)
             return false;
         memcpy(&nx, blob.data(), sizeof(int32_t));
@@ -783,6 +809,30 @@ public:
     // dimensions first via set_params + init_simulation).
     bool restore_state(const std::string &blob)
     {
+        if (blob.size() >= 4 && blob.compare(0, 4, "LKMC") == 0)
+        {
+            int32_t version = 0;
+            memcpy(&version, blob.data() + 4, sizeof(version));
+            if (version != 2)
+                return false;
+            size_t header = 16 + sizeof(step_) + sizeof(time_) + sizeof(int32_t);
+            if (blob.size() < header + lattice_.size())
+                return false;
+            size_t offset = 16;
+            memcpy(&step_, blob.data() + offset, sizeof(step_));
+            offset += sizeof(step_);
+            memcpy(&time_, blob.data() + offset, sizeof(time_));
+            offset += sizeof(time_);
+            int32_t capacity = 0;
+            memcpy(&capacity, blob.data() + offset, sizeof(capacity));
+            offset += sizeof(capacity);
+            p_.intercalation_capacity = capacity;
+            memcpy(lattice_.data(), blob.data() + offset, lattice_.size());
+            // Trailing per-column capacities are audit-only; counters
+            // are recomputed from the lattice, so they are not trusted.
+            rebuild_all_rates();
+            return true;
+        }
         size_t header = sizeof(int32_t) * 2 + sizeof(step_) + sizeof(time_);
         if (blob.size() < header + lattice_.size())
             return false;
@@ -1518,6 +1568,149 @@ public:
         finalize_carbon_placement();
         return placed;
     }
+    // ------------------------------------------------------------------
+    // Stage 5: intercalation / capacity / plating (per-column counter)
+    // Mirrors the Python implementation exactly. No new lattice value:
+    // intercalated and plating atoms keep their existing values, energies
+    // and rates. Counters are derived from the lattice on demand.
+    // P_N = total plating atoms in gap columns (excess over capacity).
+    // ------------------------------------------------------------------
+    std::vector<int> carbon_columns() const
+    {
+        std::vector<int> cols;
+        for (int y = 1; y < p_.Ny; ++y)
+            for (int x = 0; x < p_.Nx; ++x)
+                if (at(x, y) == CARBON)
+                    cols.push_back(x);
+        std::sort(cols.begin(), cols.end());
+        cols.erase(std::unique(cols.begin(), cols.end()), cols.end());
+        return cols;
+    }
+
+    std::vector<int> gap_columns() const
+    {
+        std::vector<int> carbon = carbon_columns();
+        std::vector<int> gaps;
+        for (int x = 0; x < p_.Nx; ++x)
+        {
+            if (std::find(carbon.begin(), carbon.end(), x) != carbon.end())
+                continue;
+            int left = p_.periodic_x ? ((x - 1 + p_.Nx) % p_.Nx) : x - 1;
+            int right = p_.periodic_x ? ((x + 1) % p_.Nx) : x + 1;
+            bool near = false;
+            if (left >= 0 && left < p_.Nx && std::find(carbon.begin(), carbon.end(), left) != carbon.end())
+                near = true;
+            if (right >= 0 && right < p_.Nx && std::find(carbon.begin(), carbon.end(), right) != carbon.end())
+                near = true;
+            if (near)
+                gaps.push_back(x);
+        }
+        return gaps;
+    }
+
+    int column_capacity(int x) const
+    {
+        std::vector<int> gaps = gap_columns();
+        if (std::find(gaps.begin(), gaps.end(), x) == gaps.end())
+            return 0;
+        if (p_.intercalation_capacity >= 0)
+            return p_.intercalation_capacity;
+        std::vector<int> carbon = carbon_columns();
+        int left = p_.periodic_x ? ((x - 1 + p_.Nx) % p_.Nx) : x - 1;
+        int right = p_.periodic_x ? ((x + 1) % p_.Nx) : x + 1;
+        int rows = 0;
+        for (int y = 1; y < p_.Ny; ++y)
+        {
+            bool has = false;
+            if (left >= 0 && left < p_.Nx && std::find(carbon.begin(), carbon.end(), left) != carbon.end() && at(left, y) == CARBON)
+                has = true;
+            if (right >= 0 && right < p_.Nx && std::find(carbon.begin(), carbon.end(), right) != carbon.end() && at(right, y) == CARBON)
+                has = true;
+            if (has)
+                ++rows;
+        }
+        return rows;
+    }
+
+    int column_atom_count(int x) const
+    {
+        int n = 0;
+        for (int y = 0; y < p_.Ny; ++y)
+        {
+            int8_t v = at(x, y);
+            if (v == FREE || v == DEPOSITED || v == PASSIVATED)
+                ++n;
+        }
+        return n;
+    }
+
+    int plating_count() const
+    {
+        int total = 0;
+        for (int x : gap_columns())
+            total += std::max(0, column_atom_count(x) - column_capacity(x));
+        return total;
+    }
+
+    std::string intercalation_stats_json() const
+    {
+        std::vector<int> gaps = gap_columns();
+        std::ostringstream json;
+        json << "{\"gap_columns\":[";
+        for (size_t i = 0; i < gaps.size(); ++i)
+        {
+            if (i) json << ",";
+            json << gaps[i];
+        }
+        json << "],\"capacities\":[";
+        int intercalated_total = 0, plating_total = 0;
+        for (size_t i = 0; i < gaps.size(); ++i)
+        {
+            if (i) json << ",";
+            json << column_capacity(gaps[i]);
+        }
+        json << "],\"counts\":[";
+        for (size_t i = 0; i < gaps.size(); ++i)
+        {
+            if (i) json << ",";
+            json << column_atom_count(gaps[i]);
+        }
+        json << "],\"intercalated\":[";
+        for (size_t i = 0; i < gaps.size(); ++i)
+        {
+            int cap = column_capacity(gaps[i]);
+            int n = column_atom_count(gaps[i]);
+            intercalated_total += std::min(n, cap);
+            if (i) json << ",";
+            json << std::min(n, cap);
+        }
+        json << "],\"plating\":[";
+        for (size_t i = 0; i < gaps.size(); ++i)
+        {
+            int cap = column_capacity(gaps[i]);
+            int n = column_atom_count(gaps[i]);
+            plating_total += std::max(0, n - cap);
+            if (i) json << ",";
+            json << std::max(0, n - cap);
+        }
+        json << "],\"intercalated_total\":" << intercalated_total
+             << ",\"plating_total\":" << plating_total
+             << ",\"saturated_columns\":[";
+        bool first = true;
+        for (int x : gaps)
+        {
+            int cap = column_capacity(x);
+            if (cap > 0 && column_atom_count(x) >= cap)
+            {
+                if (!first) json << ",";
+                json << x;
+                first = false;
+            }
+        }
+        json << "]}";
+        return json.str();
+    }
+
     // Guarantees a JSON-safe number token -- never emits nan/inf, which
     // are invalid JSON and break JSON.parse on the frontend.
     static double json_safe(double v)
@@ -2187,6 +2380,26 @@ extern "C"
     int get_stats_json_len()
     {
         return (int)g_stats_json_buf.size();
+    }
+
+    static std::string g_intercalation_json_buf;
+
+    EMSCRIPTEN_KEEPALIVE
+    const char *get_intercalation_json()
+    {
+        if (!wasm_sim)
+        {
+            g_intercalation_json_buf = "{}";
+            return g_intercalation_json_buf.c_str();
+        }
+        g_intercalation_json_buf = wasm_sim->intercalation_stats_json();
+        return g_intercalation_json_buf.c_str();
+    }
+
+    EMSCRIPTEN_KEEPALIVE
+    int get_intercalation_json_len()
+    {
+        return (int)g_intercalation_json_buf.size();
     }
 
     EMSCRIPTEN_KEEPALIVE
