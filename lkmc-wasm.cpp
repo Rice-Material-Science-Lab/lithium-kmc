@@ -18,8 +18,8 @@
  *  * Build:
  * em++ lkmc-wasm.cpp -o public/lkmc-wasm.js -O3 -std=c++17 -fexceptions -sINITIAL_MEMORY=268435456 -sALLOW_MEMORY_GROWTH=1 -sEXPORT_ES6=1 -sMODULARIZE=1 -sEXPORTED_FUNCTIONS="['_set_params','_update_simulation_params','_init_simulation','_mark_carbon','_unmark_carbon','_finalize_carbon_placement','_run_steps','_get_lattice_data','_get_width','_get_stats_json','_get_stats_json_len','_get_intercalation_json','_get_intercalation_json_len','_get_height','_get_lattice','_get_lattice_size','_get_fill','_get_passivated','_get_step','_get_time','_get_wall_time','_play','_pause','_stop','_step_once','_playback_tick','_set_batch_size','_set_stats_interval','_get_stats_interval','_get_playback_state','_get_terminated','_get_cell_coordination','_get_snapshot_count','_get_snapshot_step','_get_snapshot_lattice','_save_state','_get_save_state_len','_load_state','_peek_state_dimensions','_run_batch','_run_batch_begin','_run_batch_single','_run_batch_end','_get_batch_json','_cleanup_simulation','_force_update_frontend','_malloc','_free']" -sEXPORTED_RUNTIME_METHODS="['ccall','cwrap','HEAP8','HEAPU8','HEAP32','HEAPF64','wasmMemory']" -sALLOW_TABLE_GROWTH=1
  * Exported WASM stuff:
- *   _set_params(int Nx, int Ny, double d0, double T, double e0, double e1, double nu_f, double nu_d, double nu_p, double e_pass, double nu_dp, double e_dp, int seed)
- *   _update_simulation_params(double d0, double T, double nu_f, double nu_d, double nu_p, double e_pass, double e0, double e1, double nu_dp, double e_dp)
+ *   _set_params(int Nx, int Ny, double d0, double T, double e0, double e1, double nu_f, double nu_d, double nu_p, double carbon_energy, int seed)
+ *   _update_simulation_params(double d0, double T, double nu_f, double nu_d, double nu_p, double e0, double e1, double carbon_energy)
  *   _get_lattice_data()
  *   _get_width()
  *   _get_height()
@@ -509,6 +509,9 @@ public:
     // incremental Fenwick-tree updates over long runs.
     static constexpr int kRebuildInterval = 50000;
     static constexpr double kExactRateLimit = 1e14;
+    // Upper cap on passivation rate nu_p (s^-1). 0 is valid and applies
+    // no barrier / produces no passivated atoms.
+    static constexpr double kNuPMax = 1e6;
     bool rates_dirty_ = false;
 
     static KMCParams validate_parameters(const KMCParams &p)
@@ -581,7 +584,10 @@ public:
         if (p.history_filename.empty())
             throw std::invalid_argument("history_filename must not be empty.");
 
-        return p;
+        KMCParams out = p;
+        if (out.nu_p > kNuPMax)
+            out.nu_p = kNuPMax;
+        return out;
     }
 
     explicit ElectrodepositionKMC(const KMCParams &p)
@@ -2901,7 +2907,8 @@ int main(int argc, char *argv[])
 
         std::cout << "\nDone.  step=" << sim.step()
                   << "  time=" << std::scientific << std::setprecision(4) << sim.time()
-                  << "  wall=" << std::fixed << std::setprecision(2) << ws << " s\n";
+                  << "  wall=" << std::fixed << std::setprecision(2) << ws << " s"
+                  << "  passivated=" << sim.passivated_count() << '\n';
     }
     catch (const std::exception &e)
     {

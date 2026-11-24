@@ -86,6 +86,7 @@ DEPOSITED  = 2
 SUBSTRATE  = 3
 PASSIVATED = 4
 CARBON     = 5   # graphite anode site kinda like substrate
+NU_P_MAX = 1.0e6  # upper cap on passivation rate nu_p (s⁻¹)
 
 Coord = Tuple[int, int]
 
@@ -861,6 +862,10 @@ class ElectrodepositionKMC:
         if self.p.snapshot_every < 1: raise ValueError("snapshot_every must be >= 1.")
         if self.p.gui_batch_steps < 1: raise ValueError("gui_batch_steps must be >= 1.")
         if self.p.intercalation_capacity is not None and self.p.intercalation_capacity < 0: raise ValueError("intercalation_capacity must be >= 0 or None.")
+        if self.p.nu_p < 0:         raise ValueError("nu_p must be >= 0.")
+        # 0 is valid (no passivation / no barrier). Cap runaway rates.
+        if self.p.nu_p > NU_P_MAX:
+            self.p.nu_p = NU_P_MAX
 
         # ── lattice ───────────────────────────────────────────────────────
         self.lattice = np.zeros((self.p.Ny, self.p.Nx), dtype=np.int8)
@@ -1392,6 +1397,10 @@ class ElectrodepositionKMC:
         for key, value in kwargs.items():
             if key not in live_tunable:
                 continue
+            if key == "nu_p":
+                if value < 0:
+                    raise ValueError("nu_p must be >= 0.")
+                value = min(float(value), NU_P_MAX)
             if getattr(self.p, key) != value:
                 setattr(self.p, key, value)
                 changed = True
@@ -2918,7 +2927,9 @@ def params_from_cli_args(args: argparse.Namespace) -> KMCParams:
     if args.e0 is not None:
         params.e0 = args.e0
     if args.pv is not None:
-        params.nu_p = args.pv
+        if args.pv < 0:
+            raise ValueError("--pv must be >= 0.")
+        params.nu_p = min(float(args.pv), NU_P_MAX)
     if args.vf is not None:
         params.nu_f = args.vf
     if args.vd is not None:
