@@ -326,31 +326,14 @@ def _nb_desired_mobile_state(
 
 
 @njit(cache=True)
-def _nb_column_has_carbon(
-    lattice: np.ndarray,
-    x: int,
-    Ny: int,
-) -> bool:
-    """True if column x contains any CARBON site (graphite sheet column)."""
-    for y in range(1, Ny):
-        if lattice[y, x] == CARBON:
-            return True
-    return False
-
-
-@njit(cache=True)
-def _nb_is_intercalation_site(
+def _nb_carbon_neighbors(
     lattice: np.ndarray,
     x: int, y: int,
     Ny: int, Nx: int,
     periodic_x: bool,
-) -> bool:
-    """Gallery site: non-carbon column with at least one CARBON neighbour.
-    Tops/sides of carbon columns are surface sites and return False, so the
-    intercalation barrier does not suppress plating on the graphite exterior.
-    """
-    if _nb_column_has_carbon(lattice, x, Ny):
-        return False
+) -> int:
+    """How many CARBON neighbours (x, y) has. Occupancy of (x, y) does not matter."""
+    n = 0
     if y % 2 == 0:
         DX = (1, -1, 0, 0, -1, -1)
         DY = (0,  0, 1, -1, 1, -1)
@@ -368,8 +351,9 @@ def _nb_is_intercalation_site(
         if yy < 0 or yy >= Ny:
             continue
         if lattice[yy, xx] == CARBON:
-            return True
-    return False
+            n += 1
+    return n
+
 
 @njit(cache=True)
 def _nb_get_event_rate(
@@ -421,19 +405,33 @@ def _nb_get_event_rate(
     # Temporarily vacate source to compute final energy correctly
     lattice[src_y, src_x] = EMPTY
     final_type = _nb_desired_mobile_state(lattice, dst_x, dst_y, Ny, Nx, periodic_x)
-    # Gallery checks while source is vacant (dest occupancy is what matters for dst).
-    src_gal = _nb_is_intercalation_site(lattice, src_x, src_y, Ny, Nx, periodic_x)
-    dst_gal = _nb_is_intercalation_site(lattice, dst_x, dst_y, Ny, Nx, periodic_x)
     e_final    = _nb_calc_local_energy(lattice, dst_x, dst_y, Ny, Nx, final_type, energy_lookup, periodic_x)
     lattice[src_y, src_x] = atom_type  # restore
 
     dE = e_final - e_init
-    rate = nu * math.exp(-dE / (2.0 * kB * T))
-    # Symmetric gallery barrier: slows hops that enter, leave, or move within
-    # an intercalation site without breaking detailed balance.
-    if intercalation_barrier > 0.0 and (src_gal or dst_gal):
-        rate *= math.exp(-intercalation_barrier / (kB * T))
-    return rate
+    # Ordinary hops keep the symmetric saddle, nu * exp(-dE / 2kT).
+    # That includes adsorption onto the outside of a carbon stack (one
+    # carbon neighbour): downhill adsorption stays fast, so lithium sticks
+    # to the surface and further drops are not starved.
+    # A gallery site is sandwiched between sheets (two or more carbon
+    # neighbours). Hops that enter or leave a gallery use a fixed
+    # activation energy measured from the higher well:
+    #   nu * exp(-(max(dE, 0) + intercalation_barrier) / kT)
+    # The symmetric form would make that downhill step faster than the
+    # attempt frequency, so lithium would fall in on first contact. The
+    # fixed barrier is the same saddle both ways, so the rate ratio stays
+    # exp(-dE / kT). A zero barrier leaves every hop on the historical formula.
+    if intercalation_barrier > 0.0:
+        src_gallery = _nb_carbon_neighbors(
+            lattice, src_x, src_y, Ny, Nx, periodic_x
+        ) >= 2
+        dst_gallery = _nb_carbon_neighbors(
+            lattice, dst_x, dst_y, Ny, Nx, periodic_x
+        ) >= 2
+        if src_gallery != dst_gallery:
+            barrier = dE if dE > 0.0 else 0.0
+            return nu * math.exp(-(barrier + intercalation_barrier) / (kB * T))
+    return nu * math.exp(-dE / (2.0 * kB * T))
 
 
 # ---------------------------------------------------------------------------
@@ -860,11 +858,11 @@ class KMCParams:
     plot_counts_vs_time: bool = True         # v3 change: False=plot counts vs step, True=plot counts vs sim time
     stop_fill_fraction: Optional[float] = None
     stop_fill_total_sites: Optional[int] = None
-    carbon_energy: float = -0.6       # eV, graphite anode bond energy (single species)
-    # Kinetic barrier (eV) applied symmetrically to hops that touch an
-    # intercalation gallery site. Slows gallery filling so high deposition
-    # flux can plate on the graphite exterior (issue #79). 0 disables.
-    intercalation_barrier: float = 0.12
+    carbon_energy: float = -0.35      # eV, graphite bond. Softer than -0.6 so a surface cluster can compete with a gallery; still deeper than one Li-Li bond (e0).
+    # Activation energy (eV) for entering or leaving a gallery
+    # (a site with two or more carbon neighbours), measured from the
+    # higher well. Adsorption on the outside of a stack is unchanged.
+    intercalation_barrier: float = 0.30
     intercalation_capacity: Optional[int] = None  # Stage 5: per gap-column Li capacity; None = derive from neighbouring carbon height (row count)
     mem_snapshot_every: int = 10_000  # steps between in-memory scrub snapshots
     max_mem_snapshots: int = 300
@@ -1207,18 +1205,6 @@ class ElectrodepositionKMC:
                 return DEPOSITED
         return FREE
 
-    def is_intercalation_site(self, x: int, y: int) -> bool:
-        """Gallery site used for the intercalation kinetic barrier.
-        Non-carbon columns with a CARBON neighbour; carbon-column exteriors
-        are excluded so surface plating is not suppressed."""
-        for yy in range(1, self.p.Ny):
-            if int(self.lattice[yy, x]) == CARBON:
-                return False
-        for nx, ny in self.valid_neighbor_coords(x, y):
-            if int(self.lattice[ny, nx]) == CARBON:
-                return True
-        return False
-
     def get_event_rate(self, kind: str, src: Optional[Coord], dst: Coord) -> float:
         if kind == "drop":
             x1, y1 = dst
@@ -1243,15 +1229,26 @@ class ElectrodepositionKMC:
         nu = self.p.nu_f if atom_type == FREE else self.p.nu_d
         e_init = self.calc_local_energy(x0, y0, atom_type)
         self.lattice[y0, x0] = EMPTY
-        src_gal = self.is_intercalation_site(x0, y0)
-        dst_gal = self.is_intercalation_site(x1, y1)
         final_type = self.desired_mobile_state_at_site(x1, y1)
         e_final = self.calc_local_energy(x1, y1, final_type)
         self.lattice[y0, x0] = atom_type
-        rate = nu * math.exp(-(e_final - e_init) / (2.0 * self.p.kB * self.p.T))
-        if self.p.intercalation_barrier > 0.0 and (src_gal or dst_gal):
-            rate *= math.exp(-self.p.intercalation_barrier / (self.p.kB * self.p.T))
-        return rate
+        dE = e_final - e_init
+        if self.p.intercalation_barrier > 0.0:
+            src_gallery = self.carbon_neighbor_count(x0, y0) >= 2
+            dst_gallery = self.carbon_neighbor_count(x1, y1) >= 2
+            if src_gallery != dst_gallery:
+                barrier = dE if dE > 0.0 else 0.0
+                return nu * math.exp(
+                    -(barrier + self.p.intercalation_barrier) / (self.p.kB * self.p.T)
+                )
+        return nu * math.exp(-dE / (2.0 * self.p.kB * self.p.T))
+
+    def carbon_neighbor_count(self, x: int, y: int) -> int:
+        n = 0
+        for nx, ny in self.valid_neighbor_coords(x, y):
+            if int(self.lattice[ny, nx]) == CARBON:
+                n += 1
+        return n
 
     def update_rate_at_index(self, idx: int) -> None:
         kind, src, dst = self.idx_to_data[idx]
