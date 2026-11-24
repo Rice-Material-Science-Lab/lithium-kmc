@@ -13,6 +13,7 @@ e1 = -0.5
 nu_f = 5.0e9
 nu_d = 1.0e9
 nu_p = 1.0e3
+# intercalation_barrier = 0.12   # eV; gallery hop barrier (issue #79). 0 disables.
 max_steps = 200000
 max_time = 100.0
 stop_fill_fraction = 0.20

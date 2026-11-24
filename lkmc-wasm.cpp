@@ -236,6 +236,10 @@ struct KMCParams
     double carbon_energy = -0.6; // eV — graphite anode bond energy (single
     // species, matches Python KMCParams.carbon_energy exactly). Baked into
     // energy_lookup_ like any other pair, not looked up separately.
+    // Symmetric kinetic barrier (eV) for hops that touch an intercalation
+    // gallery site. Matches Python KMCParams.intercalation_barrier; 0 disables.
+    // Default 0.12 lets high-flux plating appear without needing d0 ~ 1e5 (#79).
+    double intercalation_barrier = 0.12;
     int intercalation_capacity = -1; // Stage 5: per gap-column Li capacity; -1 = derive from neighbouring carbon height (row count), >=0 overrides
     double nu_f = 5e9;  // matches Python KMCParams default
     double nu_d = 5e9;  // matches Python KMCParams default
@@ -376,6 +380,8 @@ KMCParams load_config(const std::string &path, KMCParams p = {})
             p.save_snapshots = (toInt(val, 1) != 0);
         else if (key == "save_npy")
             p.save_npy = (toInt(val, 1) != 0);
+        else if (key == "intercalation_barrier")
+            p.intercalation_barrier = toDouble(val, p.intercalation_barrier);
         else if (key == "intercalation_capacity")
             p.intercalation_capacity = toInt(val, p.intercalation_capacity);
 
@@ -562,6 +568,9 @@ public:
         require_finite(p.e0, "e0");
         require_finite(p.e1, "e1");
         require_finite(p.carbon_energy, "carbon_energy");
+        require_finite(p.intercalation_barrier, "intercalation_barrier");
+        if (p.intercalation_barrier < 0.0)
+            throw std::invalid_argument("intercalation_barrier must be >= 0.");
 
         if (p.max_steps < 0)
             throw std::invalid_argument("max_steps must be >= 0.");
@@ -1070,11 +1079,34 @@ private:
         return bonded ? DEPOSITED : FREE;
     }
 
-    // Rate formulas below mirror LKMC_v5_gui_fast.py's Numba kernel
-    // (_nb_get_event_rate) exactly -- the Python file is the source of
-    // truth for simulation physics. No custom barriers, no exposure
-    // fraction, no SEI growth suppression, no de-passivation: none of
-    // that exists in the Python kernel.
+    bool column_has_carbon(int x) const
+    {
+        for (int y = 1; y < p_.Ny; ++y)
+        {
+            if (at(x, y) == CARBON)
+                return true;
+        }
+        return false;
+    }
+
+    // Gallery site for the intercalation kinetic barrier: non-carbon
+    // column with at least one CARBON neighbour. Carbon-column exteriors
+    // (surface plating locations) return false.
+    bool is_intercalation_site(int x, int y) const
+    {
+        if (column_has_carbon(x))
+            return false;
+        bool found = false;
+        for_each_neighbour(x, y, [&](int nx, int ny)
+        {
+            if (at(nx, ny) == CARBON)
+                found = true;
+        });
+        return found;
+    }
+
+    // Rate formulas mirror HexagonalLKMC_v5_graphite.py (_nb_get_event_rate).
+    // Python remains the source of truth, including intercalation_barrier.
     double get_event_rate(const Event &ev) const
     {
         if (ev.is_drop)
@@ -1120,6 +1152,10 @@ private:
         int8_t old = const_cast<ElectrodepositionKMC *>(this)->at(x0, y0);
         const_cast<ElectrodepositionKMC *>(this)->at(x0, y0) = EMPTY;
 
+        // Gallery checks while source is vacant (matches Python).
+        bool src_gal = is_intercalation_site(x0, y0);
+        bool dst_gal = is_intercalation_site(x1, y1);
+
         // Determine the moving atom's hypothetical state at the empty
         // destination before evaluating its final local energy.
         int8_t final_type = desired_mobile_state_at_site(x1, y1);
@@ -1131,7 +1167,10 @@ private:
             return 0.0;
 
         double dE = e_final - e_init;
-        return nu * exp(-dE / (2.0 * p_.kB * p_.T));
+        double rate = nu * exp(-dE / (2.0 * p_.kB * p_.T));
+        if (p_.intercalation_barrier > 0.0 && (src_gal || dst_gal))
+            rate *= exp(-p_.intercalation_barrier / (p_.kB * p_.T));
+        return rate;
     }
 
     void update_rate_at(int idx)
@@ -1470,6 +1509,8 @@ public:
         updated.e0 = e0;
         updated.e1 = e1;
         updated.carbon_energy = carbon_energy;
+        // intercalation_barrier intentionally preserved across live updates
+        // until the website exposes a control for it.
         p_ = validate_parameters(updated);
 
         // energy_lookup_ entries that depend on p_.e0 / p_.e1 / p_.carbon_energy
@@ -2214,6 +2255,8 @@ extern "C"
         wasm_params.nu_d = nu_d;
         wasm_params.nu_p = nu_p;
         wasm_params.carbon_energy = carbon_energy;
+        // intercalation_barrier keeps KMCParams default (0.12); expose via
+        // update_simulation_params when the website grows a control for it.
         wasm_params.set_rng_seed(seed);
     }
 
