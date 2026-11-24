@@ -323,6 +323,54 @@ def _nb_desired_mobile_state(
 # Event rate computation
 # ---------------------------------------------------------------------------
 
+
+
+@njit(cache=True)
+def _nb_column_has_carbon(
+    lattice: np.ndarray,
+    x: int,
+    Ny: int,
+) -> bool:
+    """True if column x contains any CARBON site (graphite sheet column)."""
+    for y in range(1, Ny):
+        if lattice[y, x] == CARBON:
+            return True
+    return False
+
+
+@njit(cache=True)
+def _nb_is_intercalation_site(
+    lattice: np.ndarray,
+    x: int, y: int,
+    Ny: int, Nx: int,
+    periodic_x: bool,
+) -> bool:
+    """Gallery site: non-carbon column with at least one CARBON neighbour.
+    Tops/sides of carbon columns are surface sites and return False, so the
+    intercalation barrier does not suppress plating on the graphite exterior.
+    """
+    if _nb_column_has_carbon(lattice, x, Ny):
+        return False
+    if y % 2 == 0:
+        DX = (1, -1, 0, 0, -1, -1)
+        DY = (0,  0, 1, -1, 1, -1)
+    else:
+        DX = (1, -1, 0, 0, 1, 1)
+        DY = (0,  0, 1, -1, 1, -1)
+    for k in range(6):
+        xx = x + DX[k]
+        yy = y + DY[k]
+        if periodic_x:
+            xx = xx % Nx
+        else:
+            if xx < 0 or xx >= Nx:
+                continue
+        if yy < 0 or yy >= Ny:
+            continue
+        if lattice[yy, xx] == CARBON:
+            return True
+    return False
+
 @njit(cache=True)
 def _nb_get_event_rate(
     lattice: np.ndarray,
@@ -333,6 +381,7 @@ def _nb_get_event_rate(
     energy_lookup: np.ndarray,
     d0: float, nu_f: float, nu_d: float, nu_p: float,
     kB: float, T: float,
+    intercalation_barrier: float,
 ) -> float:
     if kind == 0:          # drop
         if lattice[dst_y_raw, dst_x_raw] == EMPTY:
@@ -372,11 +421,19 @@ def _nb_get_event_rate(
     # Temporarily vacate source to compute final energy correctly
     lattice[src_y, src_x] = EMPTY
     final_type = _nb_desired_mobile_state(lattice, dst_x, dst_y, Ny, Nx, periodic_x)
+    # Gallery checks while source is vacant (dest occupancy is what matters for dst).
+    src_gal = _nb_is_intercalation_site(lattice, src_x, src_y, Ny, Nx, periodic_x)
+    dst_gal = _nb_is_intercalation_site(lattice, dst_x, dst_y, Ny, Nx, periodic_x)
     e_final    = _nb_calc_local_energy(lattice, dst_x, dst_y, Ny, Nx, final_type, energy_lookup, periodic_x)
     lattice[src_y, src_x] = atom_type  # restore
 
     dE = e_final - e_init
-    return nu * math.exp(-dE / (2.0 * kB * T))
+    rate = nu * math.exp(-dE / (2.0 * kB * T))
+    # Symmetric gallery barrier: slows hops that enter, leave, or move within
+    # an intercalation site without breaking detailed balance.
+    if intercalation_barrier > 0.0 and (src_gal or dst_gal):
+        rate *= math.exp(-intercalation_barrier / (kB * T))
+    return rate
 
 
 # ---------------------------------------------------------------------------
@@ -397,6 +454,7 @@ def _nb_update_rate_at_idx(
     energy_lookup: np.ndarray,
     d0: float, nu_f: float, nu_d: float, nu_p: float,
     kB: float, T: float,
+    intercalation_barrier: float,
 ) -> None:
     new_rate = _nb_get_event_rate(
         lattice,
@@ -405,6 +463,7 @@ def _nb_update_rate_at_idx(
         ev_dst_x[idx], ev_dst_y[idx],
         Nx, Ny, periodic_x,
         energy_lookup, d0, nu_f, nu_d, nu_p, kB, T,
+        intercalation_barrier,
     )
     delta = new_rate - event_rates[idx]
     if abs(delta) > 1.0e-18:
@@ -429,6 +488,7 @@ def _nb_refresh_local_rates(
     energy_lookup: np.ndarray,
     d0: float, nu_f: float, nu_d: float, nu_p: float,
     kB: float, T: float,
+    intercalation_barrier: float,
     num_drop_events: int, num_hop_events: int, max_events: int,
     visited: np.ndarray,           # bool[Ny, Nx] — reset inside
 ) -> None:
@@ -461,6 +521,7 @@ def _nb_refresh_local_rates(
                         ev_kind, ev_src_x, ev_src_y, ev_dst_x, ev_dst_y,
                         max_events, Nx, Ny, periodic_x,
                         energy_lookup, d0, nu_f, nu_d, nu_p, kB, T,
+                        intercalation_barrier,
                     )
 
                 # Hop events (6 hex directions)
@@ -472,6 +533,7 @@ def _nb_refresh_local_rates(
                         ev_kind, ev_src_x, ev_src_y, ev_dst_x, ev_dst_y,
                         max_events, Nx, Ny, periodic_x,
                         energy_lookup, d0, nu_f, nu_d, nu_p, kB, T,
+                        intercalation_barrier,
                     )
 
                 # Passivation event
@@ -482,6 +544,7 @@ def _nb_refresh_local_rates(
                     ev_kind, ev_src_x, ev_src_y, ev_dst_x, ev_dst_y,
                     max_events, Nx, Ny, periodic_x,
                     energy_lookup, d0, nu_f, nu_d, nu_p, kB, T,
+                    intercalation_barrier,
                 )
 
 
@@ -618,6 +681,7 @@ def _nb_run_n_steps(
     energy_lookup: np.ndarray,
     d0: float, nu_f: float, nu_d: float, nu_p: float,
     kB: float, T: float,
+    intercalation_barrier: float,
     max_events: int, num_drop_events: int, num_hop_events: int,
     # Step / time limits
     n_steps_req: int,
@@ -732,6 +796,7 @@ def _nb_run_n_steps(
             all_x, all_y, n_all,
             Nx, Ny, periodic_x,
             energy_lookup, d0, nu_f, nu_d, nu_p, kB, T,
+            intercalation_barrier,
             num_drop_events, num_hop_events, max_events,
             visited,
         )
@@ -796,6 +861,10 @@ class KMCParams:
     stop_fill_fraction: Optional[float] = None
     stop_fill_total_sites: Optional[int] = None
     carbon_energy: float = -0.6       # eV, graphite anode bond energy (single species)
+    # Kinetic barrier (eV) applied symmetrically to hops that touch an
+    # intercalation gallery site. Slows gallery filling so high deposition
+    # flux can plate on the graphite exterior (issue #79). 0 disables.
+    intercalation_barrier: float = 0.12
     intercalation_capacity: Optional[int] = None  # Stage 5: per gap-column Li capacity; None = derive from neighbouring carbon height (row count)
     mem_snapshot_every: int = 10_000  # steps between in-memory scrub snapshots
     max_mem_snapshots: int = 300
@@ -861,6 +930,7 @@ class ElectrodepositionKMC:
         if self.p.snapshot_every < 1: raise ValueError("snapshot_every must be >= 1.")
         if self.p.gui_batch_steps < 1: raise ValueError("gui_batch_steps must be >= 1.")
         if self.p.intercalation_capacity is not None and self.p.intercalation_capacity < 0: raise ValueError("intercalation_capacity must be >= 0 or None.")
+        if self.p.intercalation_barrier < 0: raise ValueError("intercalation_barrier must be >= 0.")
 
         # ── lattice ───────────────────────────────────────────────────────
         self.lattice = np.zeros((self.p.Ny, self.p.Nx), dtype=np.int8)
@@ -1137,6 +1207,18 @@ class ElectrodepositionKMC:
                 return DEPOSITED
         return FREE
 
+    def is_intercalation_site(self, x: int, y: int) -> bool:
+        """Gallery site used for the intercalation kinetic barrier.
+        Non-carbon columns with a CARBON neighbour; carbon-column exteriors
+        are excluded so surface plating is not suppressed."""
+        for yy in range(1, self.p.Ny):
+            if int(self.lattice[yy, x]) == CARBON:
+                return False
+        for nx, ny in self.valid_neighbor_coords(x, y):
+            if int(self.lattice[ny, nx]) == CARBON:
+                return True
+        return False
+
     def get_event_rate(self, kind: str, src: Optional[Coord], dst: Coord) -> float:
         if kind == "drop":
             x1, y1 = dst
@@ -1161,10 +1243,15 @@ class ElectrodepositionKMC:
         nu = self.p.nu_f if atom_type == FREE else self.p.nu_d
         e_init = self.calc_local_energy(x0, y0, atom_type)
         self.lattice[y0, x0] = EMPTY
+        src_gal = self.is_intercalation_site(x0, y0)
+        dst_gal = self.is_intercalation_site(x1, y1)
         final_type = self.desired_mobile_state_at_site(x1, y1)
         e_final = self.calc_local_energy(x1, y1, final_type)
         self.lattice[y0, x0] = atom_type
-        return nu * math.exp(-(e_final - e_init) / (2.0 * self.p.kB * self.p.T))
+        rate = nu * math.exp(-(e_final - e_init) / (2.0 * self.p.kB * self.p.T))
+        if self.p.intercalation_barrier > 0.0 and (src_gal or dst_gal):
+            rate *= math.exp(-self.p.intercalation_barrier / (self.p.kB * self.p.T))
+        return rate
 
     def update_rate_at_index(self, idx: int) -> None:
         kind, src, dst = self.idx_to_data[idx]
@@ -1387,7 +1474,7 @@ class ElectrodepositionKMC:
     def update_params(self, **kwargs) -> None:
         """Live-update tunable parameters without reconstructing the sim.
         Only rate/energy fields are accepted; Nx/Ny cannot change here."""
-        live_tunable = {"T", "d0", "e0", "e1", "nu_f", "nu_d", "nu_p", "carbon_energy", "intercalation_capacity"}
+        live_tunable = {"T", "d0", "e0", "e1", "nu_f", "nu_d", "nu_p", "carbon_energy", "intercalation_barrier", "intercalation_capacity"}
         changed = False
         for key, value in kwargs.items():
             if key not in live_tunable:
@@ -1568,6 +1655,7 @@ class ElectrodepositionKMC:
             self.energy_lookup,
             self.p.d0, self.p.nu_f, self.p.nu_d, self.p.nu_p,
             self.p.kB, self.p.T,
+            self.p.intercalation_barrier,
             self.max_events, self.num_drop_events, self.num_hop_events,
             steps_to_run,
             self.p.max_steps, self.p.max_time, self.p.log_every,
